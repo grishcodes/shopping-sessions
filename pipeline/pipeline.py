@@ -43,16 +43,15 @@ def load_log(con, data, temporary, name, columns, threads):
     paths = [str(path) for path in files if path.stat().st_size]
     if paths:
         schema = ", ".join(f"'{column}': 'VARCHAR'" for column in columns)
+        paths_sql = ", ".join("'" + path.replace("'", "''") + "'" for path in paths)
         con.execute(f"""
-            CREATE TABLE {name} AS
-            SELECT * FROM read_csv(?, columns={{{schema}}}, auto_detect=false,
+            CREATE VIEW {name} AS
+            SELECT * FROM read_csv([{paths_sql}], columns={{{schema}}}, auto_detect=false,
                                    header=false, delim=',', new_line='\\n')
-        """, [paths])
+        """)
     else:
-        schema = ", ".join(f"{column} VARCHAR" for column in columns)
-        con.execute(f"CREATE TABLE {name} ({schema})")
-    for path in files:
-        path.unlink()
+        schema = ", ".join(f"NULL::VARCHAR AS {column}" for column in columns)
+        con.execute(f"CREATE VIEW {name} AS SELECT {schema} WHERE false")
 
 
 def linked_ids(data, path):
@@ -130,7 +129,7 @@ def main():
             load_log(con, data, temporary, "events",
                      ("event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"), threads)
             load_log(con, data, temporary, "clicks", ("click_id", "user_id", "campaign_id", "ts"), threads)
-            print(f"loaded inputs in {time.perf_counter() - started:.2f}s", file=sys.stderr)
+            print(f"prepared inputs in {time.perf_counter() - started:.2f}s", file=sys.stderr)
             con.execute(Path(__file__).with_name("daily.sql").read_text())
             for name in ("user_daily", "campaign_daily"):
                 target = output / name

@@ -9,31 +9,36 @@ CREATE MACRO milliseconds(s) AS CASE
 END;
 
 CREATE TABLE clean_events AS
-WITH earliest AS (
-    SELECT arg_min(struct_pack(
-        user_id := user_id, ts := ts, ingest_ts := ingest_ts, event_type := event_type,
-        product_id := product_id, price := price_cents
-    ), ingest_ts) AS e
+WITH parsed AS (
+    SELECT event_id, user_id, event_type, product_id, milliseconds(ts) AS event_ms,
+           epoch_ms(calendar(left(ingest_ts, 19))) AS ingest_ms,
+           CASE WHEN event_type = 'purchase' AND regexp_full_match(price_cents, '[0-9]+')
+                THEN try_cast(price_cents AS BIGINT)
+           END AS price_cents
     FROM events
     WHERE event_id IS NOT NULL
-    GROUP BY event_id
-), parsed AS (
-    SELECT e.*, milliseconds(e.ts) AS event_ms, epoch_ms(calendar(left(e.ingest_ts, 19))) AS ingest_ms,
-           CASE WHEN e.event_type = 'purchase' AND regexp_full_match(e.price, '[0-9]+')
-                THEN try_cast(e.price AS BIGINT)
-           END AS price_cents
-    FROM earliest
+), projected AS (
+    SELECT event_id, ingest_ms, coalesce(identities.person, user_id) AS person,
+           CASE WHEN user_id IS NOT NULL AND event_type IN ('view', 'cart', 'purchase')
+                     AND product_id IS NOT NULL AND event_ms >= start_ms AND event_ms < end_ms
+                     AND ingest_ms - event_ms <= 86400000
+                     AND (event_type <> 'purchase' OR price_cents BETWEEN 1 AND 10000000)
+                THEN event_ms
+           END AS event_ms,
+           price_cents, CASE WHEN event_type = 'purchase' THEN coalesce(category, 'unknown') END AS category
+    FROM parsed
+    CROSS JOIN limits
+    LEFT JOIN identities ON identities.id = parsed.user_id
+    LEFT JOIN products USING (product_id)
+), earliest AS (
+    -- Keep invalid copies eligible for deduplication. The winning copy's
+    -- timestamp is null if it failed any event rule.
+    SELECT arg_min(struct_pack(person := person, event_ms := event_ms,
+                               price_cents := price_cents, category := category), ingest_ms) AS e
+    FROM projected GROUP BY event_id
 )
-SELECT coalesce(identities.person, user_id) AS person, event_ms, price_cents,
-       CASE WHEN event_type = 'purchase' THEN coalesce(category, 'unknown') END AS category
-FROM parsed
-CROSS JOIN limits
-LEFT JOIN identities ON identities.id = parsed.user_id
-LEFT JOIN products USING (product_id)
-WHERE user_id IS NOT NULL AND event_type IN ('view', 'cart', 'purchase') AND product_id IS NOT NULL
-    AND event_ms >= start_ms AND event_ms < end_ms AND ingest_ms - event_ms <= 86400000
-    AND (event_type <> 'purchase' OR price_cents BETWEEN 1 AND 10000000);
-DROP TABLE events;
+SELECT e.* FROM earliest WHERE e.event_ms IS NOT NULL;
+DROP VIEW events;
 
 -- Rank distinct timestamps first. Equal-time events must all inherit the same session.
 CREATE TABLE session_events AS
@@ -83,7 +88,7 @@ CROSS JOIN limits
 JOIN campaigns USING (campaign_id)
 LEFT JOIN identities ON identities.id = parsed.user_id
 WHERE click_ms >= start_ms - 604800000 AND click_ms < end_ms;
-DROP TABLE clicks;
+DROP VIEW clicks;
 
 CREATE TABLE campaign_daily AS
 WITH last_click_candidates AS (
