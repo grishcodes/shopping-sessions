@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,18 +24,23 @@ def records(path, width):
                 yield line
 
 
-def load_log(con, data, temporary, name, columns):
-    paths = []
-    for path in sorted((data / name).glob("*.csv")):
-        cleaned = temporary / f"{name}-{len(paths)}.csv"
-        with cleaned.open("wb") as out:
-            for line in records(path, len(columns)):
-                if b"\r" in line:
-                    # Quote entire fields so DuckDB treats CR as data.
-                    line = b",".join(b'"' + field.strip(b'"') + b'"' for field in line.split(b","))
-                out.write(line + b"\n")
-        if cleaned.stat().st_size:
-            paths.append(str(cleaned))
+def load_log(con, data, temporary, name, columns, threads):
+    source = data / name
+    cleaned = temporary / name
+    cleaned.mkdir()
+    normalizer = os.environ.get("NORMALIZER")
+    if normalizer:
+        subprocess.run([normalizer, str(source), str(cleaned), str(len(columns)), str(threads)], check=True)
+    else:
+        for path in sorted(source.glob("*.csv")):
+            with (cleaned / path.name).open("wb") as out:
+                for line in records(path, len(columns)):
+                    if b"\r" in line:
+                        # Quote entire fields so DuckDB treats CR as data.
+                        line = b",".join(b'"' + field.strip(b'"') + b'"' for field in line.split(b","))
+                    out.write(line + b"\n")
+    files = sorted(cleaned.glob("*.csv"))
+    paths = [str(path) for path in files if path.stat().st_size]
     if paths:
         schema = ", ".join(f"'{column}': 'VARCHAR'" for column in columns)
         con.execute(f"""
@@ -45,7 +51,7 @@ def load_log(con, data, temporary, name, columns):
     else:
         schema = ", ".join(f"{column} VARCHAR" for column in columns)
         con.execute(f"CREATE TABLE {name} ({schema})")
-    for path in temporary.glob(f"{name}-*.csv"):
+    for path in files:
         path.unlink()
 
 
@@ -122,8 +128,8 @@ def main():
                 con.execute("CREATE TABLE identities(id VARCHAR, person VARCHAR)")
             csv_path.unlink()
             load_log(con, data, temporary, "events",
-                     ("event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"))
-            load_log(con, data, temporary, "clicks", ("click_id", "user_id", "campaign_id", "ts"))
+                     ("event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"), threads)
+            load_log(con, data, temporary, "clicks", ("click_id", "user_id", "campaign_id", "ts"), threads)
             print(f"loaded inputs in {time.perf_counter() - started:.2f}s", file=sys.stderr)
             con.execute(Path(__file__).with_name("daily.sql").read_text())
             for name in ("user_daily", "campaign_daily"):

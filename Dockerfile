@@ -1,6 +1,7 @@
-# Shopping Sessions starter: DuckDB skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
+FROM rust:1.85.1-slim-bookworm AS normalizer
+COPY native/normalize.rs /src/normalize.rs
+RUN rustc --edition=2024 -C opt-level=3 -o /normalize /src/normalize.rs
+
 FROM python:3.12-slim-bookworm
 
 # The scorer runs the container as uid 1000; give that uid a name and a home.
@@ -10,6 +11,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY pipeline/ /app/pipeline/
+COPY --from=normalizer /normalize /app/normalize
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh
 
@@ -17,7 +19,8 @@ RUN chmod +x /app/run.sh
 # no network, /data is read-only, and /output and /scratch are the only writable
 # places. run.sh points every temp and cache directory at /scratch.
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    NORMALIZER=/app/normalize
 
 WORKDIR /app
 CMD ["/app/run.sh"]

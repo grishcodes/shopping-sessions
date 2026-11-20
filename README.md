@@ -1,6 +1,6 @@
 # Shopping Sessions
 
-Pipeline for the Shopping Sessions Buildathon. DuckDB computes both daily Parquet tables from the dialect and attribution rules in [rules.md](rules.md). The Docker image runs offline and uses the input, output, and scratch directories supplied by the scorer.
+Pipeline for the Shopping Sessions Buildathon. A parallel Rust scanner validates the CSV dialect, and DuckDB computes both daily Parquet tables using [rules.md](rules.md). The Docker image runs offline and uses the input, output, and scratch directories supplied by the scorer.
 
 ## Local verification
 
@@ -21,3 +21,11 @@ make check-dev
 Build the organizer's generator with Rust 1.85 or newer using `cargo build --release --locked`. Generate the public inputs with `generate --seed 1 --events 1000000 --clicks 250000 --output dev`. Extract the official dev answer into `dev-answer/`.
 
 On Apple silicon, use `PLATFORM=linux/arm64` for fast container iteration and `linux/amd64` for the submission smoke test. Use distinct `IMAGE` values if building both architectures. Keep generated input, answers, and benchmark output outside Git.
+
+To use the Rust scanner in a direct Python run, build it with Rust 1.85 or newer.
+
+```sh
+mkdir -p .local
+rustc --edition=2024 -C opt-level=3 -o .local/normalize native/normalize.rs
+export NORMALIZER="$PWD/.local/normalize"
+```
