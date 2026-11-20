@@ -1,0 +1,8 @@
+/.local/
+/.venv/
+/dev/
+/dev-answer/
+/out/
+/scratch/
+__pycache__/
+.DS_Store

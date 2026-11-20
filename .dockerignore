@@ -1,0 +1,10 @@
+fixtures/
+dev/
+out/
+*.md
+.git
+
+.local/
+.venv/
+dev-answer/
+scratch/
