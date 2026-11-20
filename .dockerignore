@@ -8,3 +8,5 @@ out/
 .venv/
 dev-answer/
 scratch/
+
+native/target/

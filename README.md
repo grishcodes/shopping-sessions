@@ -1,6 +1,8 @@
 # Shopping Sessions
 
-Pipeline for the Shopping Sessions Buildathon. A parallel Rust scanner validates the CSV dialect, and DuckDB computes both daily Parquet tables using [rules.md](rules.md). The Docker image runs offline and uses the input, output, and scratch directories supplied by the scorer.
+The default engine reads UTF-8 CSV shards directly into typed Rust records, resolves linked IDs, selects the earliest copy of each event, and writes the two daily Parquet tables. Campaign assists use merged seven-day click intervals. The image also includes a DuckDB reference implementation. Select it with `ENGINE=duckdb` or select Rust with `ENGINE=native`.
+
+To build the native executable locally, run `cargo build --release --locked --manifest-path native/Cargo.toml` with Rust 1.85 or newer. Set `DATA_DIR`, `OUTPUT_DIR` and `NCPU` before running `native/target/release/shopping-sessions`. Use an empty output directory for each run, as the scorer does. `PROFILE=1` prints cumulative elapsed time at each stage. `EVENT_DEDUP=sort` selects the default sort-based implementation and `EVENT_DEDUP=hash` selects the hash-table variant.
 
 ## Local verification
 

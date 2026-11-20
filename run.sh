@@ -5,4 +5,8 @@ set -eu
 export DATA_DIR OUTPUT_DIR SCRATCH_DIR
 # Read-only root filesystem: everything that wants a temp or home dir gets /scratch.
 export TMPDIR="$SCRATCH_DIR" HOME="$SCRATCH_DIR"
-exec python3 /app/pipeline/pipeline.py
+case "${ENGINE:-native}" in
+    native) exec /app/shopping-sessions ;;
+    duckdb) exec python3 /app/pipeline/pipeline.py ;;
+    *) echo "unknown ENGINE: $ENGINE" >&2; exit 2 ;;
+esac

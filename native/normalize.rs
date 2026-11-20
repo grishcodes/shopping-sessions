@@ -31,7 +31,7 @@ fn normalize(source: &Path, target: &Path, width: usize) -> io::Result<()> {
         if row.contains(&b'"') && !row.split(|&byte| byte == b',').all(|field| body(field).is_some()) {
             continue;
         }
-        if row.contains(&b'\r') {
+        if row.contains(&b'\r') || row.starts_with(b"\xef\xbb\xbf") {
             for (index, field) in row.split(|&byte| byte == b',').enumerate() {
                 writer.write_all(if index == 0 { b"\"" } else { b",\"" })?;
                 writer.write_all(body(field).expect("validated quoting"))?;

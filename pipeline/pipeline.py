@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Load Shopping Sessions inputs and write both daily Parquet tables."""
 
+import codecs
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,15 @@ def records(path, width):
                 yield line
 
 
+def normalize_csv(source, target, width):
+    with target.open("wb") as out:
+        for line in records(source, width):
+            if b"\r" in line or line.startswith(codecs.BOM_UTF8):
+                # DuckDB treats an unquoted CR as a terminator and a leading BOM as syntax.
+                line = b",".join(b'"' + field.strip(b'"') + b'"' for field in line.split(b","))
+            out.write(line + b"\n")
+
+
 def load_log(con, data, temporary, name, columns, threads):
     source = data / name
     cleaned = temporary / name
@@ -33,12 +43,7 @@ def load_log(con, data, temporary, name, columns, threads):
         subprocess.run([normalizer, str(source), str(cleaned), str(len(columns)), str(threads)], check=True)
     else:
         for path in sorted(source.glob("*.csv")):
-            with (cleaned / path.name).open("wb") as out:
-                for line in records(path, len(columns)):
-                    if b"\r" in line:
-                        # Quote entire fields so DuckDB treats CR as data.
-                        line = b",".join(b'"' + field.strip(b'"') + b'"' for field in line.split(b","))
-                    out.write(line + b"\n")
+            normalize_csv(path, cleaned / path.name, len(columns))
     files = sorted(cleaned.glob("*.csv"))
     paths = [str(path) for path in files if path.stat().st_size]
     if paths:
@@ -110,12 +115,14 @@ def main():
                 CREATE TABLE limits AS SELECT epoch_ms(?::TIMESTAMPTZ) AS start_ms,
                                               epoch_ms(?::TIMESTAMPTZ) AS end_ms
             """, [manifest["window_start"], manifest["window_end"]])
-            for name, columns in (("products", "product_id,category"), ("campaigns", "campaign_id,channel")):
-                schema = ", ".join(f"'{column}': 'VARCHAR'" for column in columns.split(","))
+            for name, columns in (("products", ("product_id", "category")), ("campaigns", ("campaign_id", "channel"))):
+                schema = ", ".join(f"'{column}': 'VARCHAR'" for column in columns)
+                lookup_path = temporary / f"{name}.csv"
+                normalize_csv(data / lookup_path.name, lookup_path, len(columns))
                 con.execute(f"""
                     CREATE TABLE {name} AS SELECT * FROM read_csv(?, columns={{{schema}}},
-                                                                 header=true, auto_detect=false)
-                """, [str(data / f"{name}.csv")])
+                        header=false, auto_detect=false, delim=',', new_line='\\n')
+                """, [str(lookup_path)])
             csv_path = temporary / "identities.csv"
             linked_ids(data, csv_path)
             if csv_path.stat().st_size:

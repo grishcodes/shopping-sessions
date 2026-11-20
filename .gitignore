@@ -6,3 +6,5 @@
 /scratch/
 __pycache__/
 .DS_Store
+
+native/target/

@@ -2,6 +2,11 @@ FROM rust:1.85.1-slim-bookworm AS normalizer
 COPY native/normalize.rs /src/normalize.rs
 RUN rustc --edition=2024 -C opt-level=3 -o /normalize /src/normalize.rs
 
+WORKDIR /src/engine
+COPY native/Cargo.toml native/Cargo.lock ./
+COPY native/src/ src/
+RUN cargo build --release --locked
+
 FROM python:3.12-slim-bookworm
 
 # The scorer runs the container as uid 1000; give that uid a name and a home.
@@ -12,6 +17,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY pipeline/ /app/pipeline/
 COPY --from=normalizer /normalize /app/normalize
+COPY --from=normalizer /src/engine/target/release/shopping-sessions /app/shopping-sessions
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh
 
