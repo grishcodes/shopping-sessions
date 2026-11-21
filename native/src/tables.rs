@@ -1,32 +1,65 @@
 use crate::input::{DAY, Key, Names, WEEK};
 use ahash::AHashMap;
 
-/// Epoch-stamped dense arrays replacing the per-person assists hashmap.
-/// Indexed by campaign id (0..n_campaigns); `epoch[c] == cur` means the
-/// start/end entries belong to the current person. `touched` lists the
-/// campaigns seen for the current person so the flush loop visits only
-/// those. Allocated once per shard, reused across persons with no clearing.
+/// Sliding 7-day click window for the fused visit (stacking).
+/// For the current person, `cnt[c]` (valid when `epoch[c] == cur`) is the
+/// number of that campaign's clicks with timestamps in the window ending at
+/// the current session start; `active` lists the campaigns with `cnt > 0`,
+/// maintained by swap-remove via `pos`, so a session start credits exactly
+/// the campaigns with a valid click in [start - 7d, start]. Allocated once
+/// per shard, reused across persons with no clearing.
 struct AssistState {
-    start: Vec<i64>,
-    end: Vec<i64>,
+    cnt: Vec<u32>,
     epoch: Vec<u32>,
-    touched: Vec<u32>,
+    pos: Vec<u32>,
+    active: Vec<u32>,
     cur: u32,
 }
 impl AssistState {
     fn new(n_campaigns: usize) -> Self {
         Self {
-            start: vec![0; n_campaigns],
-            end: vec![0; n_campaigns],
+            cnt: vec![0; n_campaigns],
             epoch: vec![0; n_campaigns],
-            touched: Vec::new(),
+            pos: vec![0; n_campaigns],
+            active: Vec::new(),
             cur: 0,
         }
     }
     #[inline]
     fn begin_person(&mut self) {
         self.cur += 1;
-        self.touched.clear();
+        self.active.clear();
+    }
+    #[inline]
+    fn add(&mut self, camp: u32) {
+        let camp = camp as usize;
+        // Push when the campaign is new for this person (epoch) OR was
+        // previously removed from the window (cnt == 0): in the latter case
+        // epoch is still cur but the campaign is no longer in `active`.
+        if self.epoch[camp] != self.cur || self.cnt[camp] == 0 {
+            self.epoch[camp] = self.cur;
+            self.cnt[camp] = 1;
+            self.pos[camp] = self.active.len() as u32;
+            self.active.push(camp as u32);
+        } else {
+            self.cnt[camp] += 1;
+        }
+    }
+    #[inline]
+    fn remove(&mut self, camp: u32) {
+        let camp = camp as usize;
+        debug_assert_eq!(self.epoch[camp], self.cur);
+        debug_assert!(self.cnt[camp] > 0);
+        self.cnt[camp] -= 1;
+        if self.cnt[camp] == 0 {
+            let at = self.pos[camp] as usize;
+            let last = *self.active.last().unwrap();
+            self.active.swap_remove(at);
+            if last != camp as u32 {
+                self.active[at] = last;
+                self.pos[last as usize] = at as u32;
+            }
+        }
     }
 }
 
@@ -180,6 +213,9 @@ struct Session {
     ts: i64,
     day: i32,
     revenue: i64,
+    /// Winner campaign for this session (0 = organic), fixed at session
+    /// start when the latest click is known; credited after the walk.
+    credit: u32,
 }
 
 fn finish_row(
@@ -204,23 +240,6 @@ fn finish_row(
         })
         .map(|(c, _)| c);
     users.push(row);
-}
-
-fn count_interval(
-    sessions: &[Session],
-    campaigns: &mut [Credit],
-    n_days: usize,
-    day0: i32,
-    campaign: u32,
-    lo: i64,
-    hi: i64,
-) {
-    let from = sessions.partition_point(|s| s.ts < lo);
-    let until = from + sessions[from..].partition_point(|s| s.ts <= hi);
-    for starts in sessions[from..until].chunk_by(|a, b| a.day == b.day) {
-        campaigns[campaign as usize * n_days + (starts[0].day - day0) as usize]
-            .assists += starts.len() as i64;
-    }
 }
 
 /// Sessionize one person's events (in timestamp order) and clicks (in
@@ -251,6 +270,15 @@ fn process_person<E: EventRow, C: ClickRow>(
     // at midnight. Recompute the division only when crossing it.
     let mut day = 0i32;
     let mut next_midnight = i64::MIN;
+    // Fused visit: the sessionize walk carries the click pointer. `next`
+    // is the first click not yet admitted to the window, `win_head` the
+    // first click still inside it; `latest` is the latest click at or
+    // before the current session start (tie -> smallest id, as before).
+    // Clicks and session starts are both in timestamp order, so both
+    // pointers only move forward.
+    let mut next = 0usize;
+    let mut win_head = 0usize;
+    let mut latest: Option<(u32, i64, Key)> = None;
     for e in person {
         let ts = origin + i64::from(e.ts_off());
         if previous.is_none_or(|last| ts - last > 1_800_000) {
@@ -258,10 +286,49 @@ fn process_person<E: EventRow, C: ClickRow>(
                 day = ts.div_euclid(DAY) as i32;
                 next_midnight = (i64::from(day) + 1) * DAY;
             }
+            // Admit clicks at or before this session start, tracking the
+            // latest for the winner credit.
+            while next < ads.len() {
+                let c = &ads[next];
+                let cts = origin + i64::from(c.ts_off());
+                if cts > ts {
+                    break;
+                }
+                if latest.is_none_or(|(_, old_ts, old_id)| {
+                    cts > old_ts || names.less(c.id(), old_id)
+                }) {
+                    latest = Some((c.campaign(), cts, c.id()));
+                }
+                assist.add(c.campaign());
+                next += 1;
+            }
+            // Evict clicks older than 7 days before this session start.
+            // A click assists a session iff its ts is in [start - 7d, start]
+            // (the old interval-merge condition, restated as a window).
+            let cutoff = ts - WEEK;
+            while win_head < next {
+                let cts = origin + i64::from(ads[win_head].ts_off());
+                if cts >= cutoff {
+                    break;
+                }
+                assist.remove(ads[win_head].campaign());
+                win_head += 1;
+            }
+            // Winner: latest click within 7 days, else organic (campaign 0).
+            let credit = latest
+                .filter(|(_, cts, _)| ts - cts <= WEEK)
+                .map_or(0, |(camp, _, _)| camp);
+            // Assists: every campaign with a click in the window credits
+            // this session start, in its day cell.
+            let day_idx = (day - day0) as usize;
+            for &camp in assist.active.iter() {
+                campaigns[camp as usize * n_days + day_idx].assists += 1;
+            }
             sessions.push(Session {
                 ts,
                 day,
                 revenue: 0,
+                credit,
             });
             if daily.as_ref().is_none_or(|row| row.day != day) {
                 if let Some(row) = daily.take() {
@@ -297,69 +364,13 @@ fn process_person<E: EventRow, C: ClickRow>(
     }
     finish_row(daily.unwrap(), category_revenue, users, names, categories);
 
-    let mut next = 0;
-    let mut latest: Option<(&C, i64)> = None;
+    // Winner credits were fixed at each session start (revenue is only
+    // known now that the walk is done); apply them from the sessions.
     for session in sessions.iter() {
-        while next < ads.len() {
-            let c = &ads[next];
-            let cts = origin + i64::from(c.ts_off());
-            if cts > session.ts {
-                break;
-            }
-            if latest.is_none_or(|(old, old_ts)| cts > old_ts || names.less(c.id(), old.id())) {
-                latest = Some((c, cts));
-            }
-            next += 1;
-        }
-        let id = latest
-            .filter(|(_, cts)| session.ts - cts <= WEEK)
-            .map_or(0, |(c, _)| c.campaign());
-        let credit = &mut campaigns[id as usize * n_days + (session.day - day0) as usize];
+        let credit = &mut campaigns[session.credit as usize * n_days + (session.day - day0) as usize];
         credit.sessions += 1;
         credit.revenue += session.revenue;
         credit.purchases += i64::from(session.revenue != 0);
-    }
-    // Merge the inclusive attribution intervals per campaign, then count the
-    // covered session starts by day. Identical click copies are idempotent here
-    // and under the latest-time/smallest-ID selection above. Interval-merge
-    // logic unchanged; only the storage moved from a per-person hashmap to
-    // epoch-stamped dense arrays indexed by campaign id.
-    for c in ads.iter() {
-        let cts = origin + i64::from(c.ts_off());
-        let end = cts + WEEK;
-        let camp = c.campaign() as usize;
-        if assist.epoch[camp] != assist.cur {
-            assist.epoch[camp] = assist.cur;
-            assist.start[camp] = cts;
-            assist.end[camp] = end;
-            assist.touched.push(c.campaign());
-        } else {
-            if cts > assist.end[camp] {
-                count_interval(
-                    sessions,
-                    campaigns,
-                    n_days,
-                    day0,
-                    c.campaign(),
-                    assist.start[camp],
-                    assist.end[camp],
-                );
-                assist.start[camp] = cts;
-            }
-            assist.end[camp] = end;
-        }
-    }
-    for &camp in assist.touched.iter() {
-        let camp = camp as usize;
-        count_interval(
-            sessions,
-            campaigns,
-            n_days,
-            day0,
-            camp as u32,
-            assist.start[camp],
-            assist.end[camp],
-        );
     }
 }
 

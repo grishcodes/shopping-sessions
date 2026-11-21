@@ -47,23 +47,39 @@ fn fields<'a, const N: usize>(
     mut commas: u128,
     quotes: u128,
 ) -> Option<[&'a [u8]; N]> {
-    if N == 0 || commas.count_ones() as usize != N - 1 {
+    // P3 (stacking): the caller folds the end-of-line sentinel into `commas`
+    // (bit `line.len()`), so the comma count here includes it. Microbench
+    // (scratch/parse-teardown, S1 quoted corpus): validation-only change
+    // 65.8 -> 65.1 ns/row; the trim change below is the bulk of the win.
+    if N == 0 || commas.count_ones() as usize != N {
         return None;
     }
+    // Field-start quotes, hoisted for the trim bit-test below (0 when no quotes).
+    let opens = quotes & ((commas << 1) | 1);
     let mut start = 0;
     if quotes != 0 {
         // The sentinel terminates the last field just like a comma. An
         // opening quote subtracts from the first delimiter to its right.
         // Each field has its own delimiter, so the borrows cannot overlap.
-        let delimiters = commas | (1u128 << line.len());
-        let opens = quotes & ((commas << 1) | 1);
+        // XOR merge: each quote must be exactly one of open/close.
+        let delimiters = commas;
         let closes = quotes & (delimiters >> 1);
         let borrowed = delimiters & !(delimiters.wrapping_sub(opens));
-        if (opens | closes) != quotes || opens & closes != 0 || borrowed != (closes << 1) {
+        if (opens ^ closes) != quotes || borrowed != (closes << 1) {
             return None;
         }
     }
     let mut output = [&line[..0]; N];
+    // A field is quoted iff its start bit is in `opens` (validation proved
+    // each open pairs with a close at the field's last char, so a quoted
+    // field has len >= 2). Test the bit via u64 halves: no per-field byte
+    // load, and the unchecked slice below drops two bounds checks per field.
+    // SAFETY: trim == 1 implies raw.len() >= 2 with quotes at both ends (see
+    // above: the borrow check forces the open's close to be the field's last
+    // char, and the XOR check forces open != close), so
+    // raw[trim..raw.len() - trim] is always in bounds; trim == 0 is trivial.
+    let o_lo = opens as u64;
+    let o_hi = (opens >> 64) as u64;
     for (i, field) in output.iter_mut().enumerate() {
         let end = if i + 1 == N {
             line.len()
@@ -73,8 +89,12 @@ fn fields<'a, const N: usize>(
             index
         };
         let raw = &line[start..end];
-        let trim = usize::from(quotes != 0 && raw.first() == Some(&b'"'));
-        *field = &raw[trim..raw.len() - trim];
+        let trim = if start < 64 {
+            ((o_lo >> start) & 1) as usize
+        } else {
+            ((o_hi >> (start - 64)) & 1) as usize
+        };
+        *field = unsafe { raw.get_unchecked(trim..raw.len() - trim) };
         start = end + 1;
     }
     Some(output)
@@ -102,7 +122,10 @@ fn scan<const N: usize>(
         let (c0, q0) = masks(line[..32].try_into().unwrap());
         let (c1, q1) = masks(line[last..].try_into().unwrap());
         // Overlapping edge loads mark the same bits, which OR combines exactly.
-        let mut commas = u128::from(c0) | (u128::from(c1) << last);
+        // The tail chunk ends at line.len(), so bit 32 of its word is the
+        // end-of-line sentinel for fields(): folded in here for free (the
+        // shift below already exists), instead of a variable u128 shift there.
+        let mut commas = u128::from(c0) | ((u128::from(c1) | (1u128 << 32)) << last);
         let mut quotes = u128::from(q0) | (u128::from(q1) << last);
         if last > 32 {
             let (c, q) = masks(line[32..64].try_into().unwrap());
