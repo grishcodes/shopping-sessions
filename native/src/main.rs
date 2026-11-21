@@ -5,10 +5,12 @@ mod fastrows;
 mod identity;
 mod input;
 mod output;
+mod radix;
 mod scan;
 mod singletons;
 mod tables;
 use ahash::AHashMap;
+use identity::Canon;
 use input::{BAD, DAY, Files, Key, Keys, WEEK, hash, rows, stamp};
 use rayon::prelude::*;
 use std::{
@@ -16,12 +18,21 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use tables::{CampaignDays, Click, Event};
+use tables::{Click, Credit, Event, RawEvent};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-const SHARDS: usize = 128;
+fn n_shards() -> usize {
+    static SHARDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SHARDS.get_or_init(|| {
+        std::env::var("SHARDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1 && n.is_power_of_two())
+            .unwrap_or(128)
+    })
+}
 
-fn link_map(data: &Path, keys: &Keys) -> Result<AHashMap<Key, Key>> {
+fn link_map(data: &Path, keys: &Keys) -> Result<Canon> {
     let files = Files::open(&data.join("links"))?;
     let chunks = files.chunks();
     let edges: Vec<Vec<_>> = chunks
@@ -39,13 +50,13 @@ fn link_map(data: &Path, keys: &Keys) -> Result<AHashMap<Key, Key>> {
     Ok(identity::build(edges, keys))
 }
 fn buckets<T>() -> Vec<Vec<T>> {
-    (0..SHARDS).map(|_| Vec::new()).collect()
+    (0..n_shards()).map(|_| Vec::new()).collect()
 }
 // Size the initial buffers from input bytes. Rows wider or shorter than the
 // estimate use normal Vec growth. The estimate never affects field validation.
 fn reserved_buckets<T>(rows: usize) -> Vec<Vec<T>> {
-    (0..SHARDS)
-        .map(|_| Vec::with_capacity(rows.div_ceil(SHARDS)))
+    (0..n_shards())
+        .map(|_| Vec::with_capacity(rows.div_ceil(n_shards())))
         .collect()
 }
 fn report_buffers<T>(label: &str, blocks: &[Vec<Vec<T>>]) {
@@ -75,42 +86,42 @@ fn redistribute<T>(blocks: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
     }
     shards
 }
-fn gather<T>(parts: Vec<Vec<T>>) -> Vec<T> {
-    let mut items = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-    for part in parts {
-        items.extend(part)
-    }
-    items
-}
 fn shard(id: Key) -> usize {
-    (hash(id) as usize) & (SHARDS - 1)
+    (hash(id) as usize) & (n_shards() - 1)
 }
 #[derive(Copy, Clone)]
 struct CopyOfEvent {
     id: Key,
     ingest: i64,
-    event: Event,
+    event: RawEvent,
 }
 fn winners(
     packed: Vec<compact::Part>,
-    origin: i64,
+    lo: i64,
     mode: &str,
-    canon: &AHashMap<Key, Key>,
+    canon: &Canon,
 ) -> Vec<Vec<Event>> {
     let mut out = reserved_buckets(packed.iter().map(compact::Part::len).sum());
-    let mut emit = |mut e: Event| {
+    // Narrow transit event: ms offset from (lo - WEEK), price in the low
+    // 24 bits, category in bits 24..28.
+    let origin = lo - WEEK;
+    let mut emit = |e: RawEvent| {
         if e.ts != BAD {
-            e.user = *canon.get(&e.user).unwrap_or(&e.user);
-            out[shard(e.user)].push(e);
+            let user = canon.get(e.user).unwrap_or(e.user);
+            out[shard(user)].push(Event {
+                user,
+                ts: (e.ts - origin) as u32,
+                price_cat: e.price | (e.category << 24),
+            });
         }
     };
     if mode == "singletons" {
-        compact::select(&packed, origin, emit);
+        compact::select(&packed, lo, emit);
         return out;
     }
     let mut copies: Vec<CopyOfEvent> = packed
         .into_iter()
-        .flat_map(|part| part.expand(origin))
+        .flat_map(|part| part.expand(lo))
         .collect();
     if matches!(mode, "radix" | "compact-hash") {
         dedup::select(&copies, mode, emit);
@@ -133,6 +144,19 @@ fn winners(
         }
     }
     out
+}
+fn cpu_now() -> f64 {
+    if let Ok(stat) = fs::read_to_string("/proc/self/stat") {
+        if let Some(after) = stat.rsplit(')').next() {
+            let fields: Vec<&str> = after.split_whitespace().collect();
+            if fields.len() > 12 {
+                let ticks: i64 =
+                    fields[11].parse().unwrap_or(0) + fields[12].parse().unwrap_or(0);
+                return ticks as f64 / 100.0;
+            }
+        }
+    }
+    0.0
 }
 fn run() -> Result<()> {
     let start = Instant::now();
@@ -230,14 +254,14 @@ fn run() -> Result<()> {
                                 } else {
                                     0
                                 };
-                                Event {
+                                RawEvent {
                                     user: keys.id(user),
                                     ts,
                                     price: price as u32,
                                     category,
                                 }
                             } else {
-                                Event {
+                                RawEvent {
                                     user: 0,
                                     ts: BAD,
                                     price: 0,
@@ -292,10 +316,10 @@ fn run() -> Result<()> {
                         return;
                     };
                     let user = keys.id(user);
-                    let user = *canon.get(&user).unwrap_or(&user);
+                    let user = canon.get(user).unwrap_or(user);
                     parts[shard(user)].push(Click {
                         user,
-                        ts,
+                        ts: (ts - (lo - WEEK)) as u32,
                         id: keys.id(id),
                         campaign,
                     });
@@ -309,31 +333,54 @@ fn run() -> Result<()> {
     drop(canon);
     mark("parsed clicks");
     let names = keys.names();
+    let n_campaigns = campaign_names.len();
+    let day0 = (lo / DAY) as i32;
+    let n_days = ((hi - 1).div_euclid(DAY) - lo.div_euclid(DAY) + 1) as usize;
     let results: Vec<_> = events
         .into_par_iter()
         .zip(redistribute(ads))
-        .map(|(e, c)| tables::summarize(gather(e), gather(c), &names, &categories))
+        .map(|(e, c)| {
+            tables::summarize(
+                e,
+                c,
+                &names,
+                &categories,
+                n_campaigns,
+                day0,
+                n_days,
+                lo,
+            )
+        })
         .collect();
     mark("computed daily tables");
     let users = output.join("user_daily");
     let campaign_dir = output.join("campaign_daily");
     fs::create_dir_all(&users)?;
     fs::create_dir_all(&campaign_dir)?;
-    let mut totals = CampaignDays::new();
+    // Parallel element-wise sum of the dense per-shard campaign arrays.
+    // Replaces the serial 128-way hashmap merge.
+    let n_cells = n_campaigns * n_days;
+    let totals: Vec<Credit> = (0..n_cells)
+        .into_par_iter()
+        .map(|i| {
+            let mut acc = Credit::default();
+            for (_, days) in &results {
+                let c = days[i];
+                acc.sessions += c.sessions;
+                acc.purchases += c.purchases;
+                acc.revenue += c.revenue;
+                acc.assists += c.assists;
+            }
+            acc
+        })
+        .collect();
     let mut shards = Vec::new();
-    for (rows, days) in results {
+    for (rows, _) in results {
         shards.push(rows);
-        for (key, v) in days {
-            let d = totals.entry(key).or_default();
-            d.sessions += v.sessions;
-            d.purchases += v.purchases;
-            d.revenue += v.revenue;
-            d.assists += v.assists;
-        }
     }
-    let partitions = threads.min(SHARDS);
+    let partitions = threads.min(n_shards());
     shards
-        .par_chunks(SHARDS.div_ceil(partitions))
+        .par_chunks(n_shards().div_ceil(partitions))
         .enumerate()
         .try_for_each(|(part, group)| {
             let path = users.join(format!("part-{part}.parquet"));
@@ -342,11 +389,20 @@ fn run() -> Result<()> {
     output::campaigns(
         &campaign_dir.join("part-0.parquet"),
         totals,
+        day0,
+        n_days,
         &names,
         &campaign_names,
     )?;
     mark("wrote parquet");
-    Ok(())
+    if profile {
+        // CPU time actually consumed (user+sys), robust to a loaded box.
+        eprintln!("cpu {:.3}", cpu_now());
+    }
+    // Skip dropping the large buffers and mappings: the OS reclaims them
+    // on exit, and the scorer clocks container start to process exit.
+    // All output files are already closed above.
+    std::process::exit(0);
 }
 fn main() {
     if let Err(e) = run() {

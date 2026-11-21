@@ -1,8 +1,8 @@
 use crate::{
-    CopyOfEvent, SHARDS,
+    CopyOfEvent,
     input::{BAD, Key},
     singletons::location,
-    tables::Event,
+    tables::RawEvent,
 };
 use ahash::AHashMap;
 use std::collections::hash_map::Entry;
@@ -20,7 +20,7 @@ struct Packed {
 }
 #[derive(Clone, Copy)]
 struct Extended {
-    event: Event,
+    event: RawEvent,
     ingest: i64,
 }
 pub(crate) struct Part {
@@ -43,7 +43,7 @@ impl Part {
     }
 
     #[inline(always)]
-    pub(crate) fn push(&mut self, id: Key, ingest: i64, event: Event, origin: i64) {
+    pub(crate) fn push(&mut self, id: Key, ingest: i64, event: RawEvent, origin: i64) {
         let ingest_delta = ingest.wrapping_sub(origin);
         let event_delta = event.ts.wrapping_sub(origin) as u64;
         let row = if ingest_delta == i64::from(ingest_delta as i32)
@@ -84,7 +84,7 @@ impl Part {
     }
 
     #[inline(always)]
-    fn event(&self, row: &Packed, origin: i64) -> Event {
+    fn event(&self, row: &Packed, origin: i64) -> RawEvent {
         if row.event_ms == WIDE {
             return self.overflow[row.user_or_slot as usize].event;
         }
@@ -93,7 +93,7 @@ impl Part {
         } else {
             origin.wrapping_add(i64::from(row.event_ms))
         };
-        Event {
+        RawEvent {
             user: row.user_or_slot,
             ts,
             price: 0,
@@ -114,13 +114,13 @@ impl Part {
 }
 
 pub(crate) fn buckets(estimated: usize) -> Vec<Part> {
-    (0..SHARDS)
-        .map(|_| Part::with_capacity(estimated.div_ceil(SHARDS)))
+    (0..crate::n_shards())
+        .map(|_| Part::with_capacity(estimated.div_ceil(crate::n_shards())))
         .collect()
 }
 
 pub(crate) fn transpose(blocks: Vec<Vec<Part>>) -> Vec<Vec<Part>> {
-    let mut shards: Vec<Vec<Part>> = (0..SHARDS).map(|_| Vec::new()).collect();
+    let mut shards: Vec<Vec<Part>> = (0..crate::n_shards()).map(|_| Vec::new()).collect();
     for block in blocks {
         for (shard, part) in shards.iter_mut().zip(block) {
             if part.len() > 0 {
@@ -156,7 +156,7 @@ struct Bits {
 /// Same two-bit singleton filter and exact survivor selection as the full layout.
 /// A reference to its fragment travels with an ambiguous row to resolve its
 /// optional extended slot. Singleton rows never materialize an ingest timestamp.
-pub(crate) fn select(parts: &[Part], origin: i64, mut emit: impl FnMut(Event)) {
+pub(crate) fn select(parts: &[Part], origin: i64, mut emit: impl FnMut(RawEvent)) {
     let count: usize = parts.iter().map(Part::len).sum();
     if count == 0 {
         return;
@@ -201,8 +201,8 @@ pub(crate) fn select(parts: &[Part], origin: i64, mut emit: impl FnMut(Event)) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn event(user: u64, ts: i64, price: u32, category: u32) -> Event {
-        Event {
+    fn event(user: u64, ts: i64, price: u32, category: u32) -> RawEvent {
+        RawEvent {
             user,
             ts,
             price,

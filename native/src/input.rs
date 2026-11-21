@@ -107,7 +107,25 @@ impl Files {
             let f = File::open(path)?;
             if f.metadata()?.len() != 0 {
                 // Scorer inputs stay read-only for the lifetime of the map.
-                maps.push(unsafe { Mmap::map(&f)? });
+                let map = unsafe { Mmap::map(&f)? };
+                // Best-effort: start async readahead of the whole file now
+                // (later files get read while earlier ones parse) and hint
+                // for huge pages to cut TLB misses on first touch. The
+                // kernel may ignore either; errors are not fatal.
+                #[cfg(unix)]
+                unsafe {
+                    libc::madvise(
+                        map.as_ptr() as *mut libc::c_void,
+                        map.len(),
+                        libc::MADV_WILLNEED,
+                    );
+                    libc::madvise(
+                        map.as_ptr() as *mut libc::c_void,
+                        map.len(),
+                        libc::MADV_HUGEPAGE,
+                    );
+                }
+                maps.push(map);
             }
         }
         Ok(Self(maps))
