@@ -5,10 +5,7 @@ RUN rustc --edition=2024 -C opt-level=3 -o /normalize /src/normalize.rs
 WORKDIR /src/engine
 COPY native/Cargo.toml native/Cargo.lock ./
 COPY native/src/ src/
-ARG TARGETARCH
-RUN if [ "$TARGETARCH" = amd64 ]; then \
-        cargo rustc --release --locked -- -C target-cpu=x86-64-v3; \
-    else cargo build --release --locked; fi
+RUN cargo build --release --locked
 
 FROM python:3.12-slim-bookworm
 
