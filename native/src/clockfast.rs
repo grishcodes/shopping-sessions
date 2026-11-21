@@ -47,7 +47,7 @@ fn pair(s: &[u8], i: usize) -> u32 {
     }
 }
 
-#[inline]
+#[inline(always)]
 pub fn event(month: &Month, s: &[u8]) -> i64 {
     if let Ok(digits) = <&[u8; 13]>::try_from(s) {
         return epoch_13(digits);

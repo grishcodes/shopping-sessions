@@ -4,8 +4,7 @@ use crate::{
     singletons::location,
     tables::RawEvent,
 };
-use ahash::AHashMap;
-use std::collections::hash_map::Entry;
+use crate::fastmap::U64Map;
 
 // Two distinct markers leave offsets 0..=4_294_967_293 available.
 const INVALID: u32 = u32::MAX - 1;
@@ -172,29 +171,31 @@ pub(crate) fn select(parts: &[Part], origin: i64, mut emit: impl FnMut(RawEvent)
             w.seen |= b;
         }
     }
-    let mut ambiguous = AHashMap::<Key, (&Part, &Packed)>::with_capacity(count / 16);
-    for part in parts {
-        for row in &part.rows {
+    // Ambiguous IDs (repeated, or sharing filter bits with a repeated ID)
+    // resolve exactly: the earliest ingest wins, keyed by the full ID.
+    // Values are (part index, row index) into `parts`.
+    let mut ambiguous = U64Map::<(u32, u32)>::with_capacity(count / 16, (0, 0));
+    for (pi, part) in parts.iter().enumerate() {
+        for (ri, row) in part.rows.iter().enumerate() {
             let (i, b) = location(row.id, mask);
             if bitmap[i].repeated & b != b {
                 emit(part.event(row, origin));
             } else {
-                match ambiguous.entry(row.id) {
-                    Entry::Vacant(v) => {
-                        v.insert((part, row));
-                    }
-                    Entry::Occupied(mut v) => {
-                        let (previous, old) = *v.get();
-                        if part.ingest(row, origin) < previous.ingest(old, origin) {
-                            v.insert((part, row));
-                        }
+                let here = (pi as u32, ri as u32);
+                let ((opi, ori), fresh) = ambiguous.entry(row.id, || here);
+                if !fresh {
+                    let previous = &parts[opi as usize];
+                    let old = &previous.rows[ori as usize];
+                    if part.ingest(row, origin) < previous.ingest(old, origin) {
+                        ambiguous.set(row.id, here);
                     }
                 }
             }
         }
     }
-    for (part, row) in ambiguous.into_values() {
-        emit(part.event(row, origin));
+    for (_, (pi, ri)) in ambiguous.iter() {
+        let part = &parts[pi as usize];
+        emit(part.event(&part.rows[ri as usize], origin));
     }
 }
 

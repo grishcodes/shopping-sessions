@@ -24,7 +24,29 @@ struct Dictionary {
 pub struct Keys(Mutex<Dictionary>);
 pub struct Names(Vec<Vec<u8>>);
 impl Keys {
+    /// Hot path, inlined into every parse loop: the common 9-byte ASCII ID
+    /// packs in a handful of instructions. Everything else (shorter or
+    /// non-ASCII IDs, the interning dictionary) goes through the out-of-line
+    /// `id_slow`, which is the unchanged general implementation, so keeping
+    /// its register-heavy mutex path out of the caller removes the call
+    /// prologue/epilogue from every row.
+    #[inline(always)]
     pub fn id(&self, s: &[u8]) -> Key {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        if let Ok(nine) = <&[u8; 9]>::try_from(s) {
+            let bytes = u64::from_be_bytes(nine[1..].try_into().unwrap());
+            let high = 0x8080_8080_8080_8080;
+            let zeros = bytes.wrapping_sub(0x0101_0101_0101_0101) & !bytes & high;
+            if nine[0] > 0 && nine[0] < 128 && bytes & high == 0 && zeros == 0 {
+                let payload = unsafe { std::arch::x86_64::_pext_u64(bytes, !high) };
+                return (u64::from(nine[0]) << 56) | payload;
+            }
+        }
+        self.id_slow(s)
+    }
+    #[cold]
+    #[inline(never)]
+    fn id_slow(&self, s: &[u8]) -> Key {
         if s.is_empty() {
             return 0;
         }
@@ -193,6 +215,7 @@ fn pair(s: &[u8], i: usize) -> i64 {
         i64::from(a * 10 + b)
     }
 }
+#[inline(never)]
 pub fn stamp(s: &[u8]) -> i64 {
     if !matches!(s.len(), 20 | 25) || s[4] != b'-' {
         return digits(s, i64::MAX);
@@ -249,12 +272,14 @@ pub fn stamp(s: &[u8]) -> i64 {
         - 719468;
     ((days * 1440 + h * 60 + min - offset) * 60 + sec) * 1000
 }
-pub fn hash(mut x: Key) -> u64 {
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d049bb133111eb);
-    x ^ (x >> 31)
+/// Shard/filter hash. Only load balance and filter false-positive rates
+/// depend on its quality; every consumer verifies exact keys. One multiply
+/// plus a fold: the low bits mix in the product's high half, so both the
+/// low (shard) and middle/high (filter) bit ranges are well distributed.
+#[inline(always)]
+pub fn hash(x: Key) -> u64 {
+    let p = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    p ^ (p >> 32)
 }
 
 // Ingest timestamps are guaranteed to be valid UTC whole seconds. Cache the
@@ -327,15 +352,19 @@ impl Month {
     }
     /// (base, length) for the month whose `YYYY-MM-` prefix matches, if either
     /// cached month does.
+    #[inline(always)]
     pub(crate) fn base_len(&self, prefix: &[u8]) -> Option<(i64, i64)> {
-        if prefix == self.prefix {
+        // One 8-byte load and two integer compares instead of slice equality.
+        let p = u64::from_le_bytes(prefix[..8].try_into().unwrap());
+        if p == u64::from_le_bytes(self.prefix) {
             Some((self.base, self.length))
-        } else if prefix == self.prefix2 {
+        } else if p == u64::from_le_bytes(self.prefix2) {
             Some((self.base2, self.length2))
         } else {
             None
         }
     }
+    #[inline(always)]
     pub fn ingest(&self, s: &[u8]) -> i64 {
         if s.len() != 20 {
             return stamp(s);
@@ -347,6 +376,7 @@ impl Month {
         let two = |at: usize| i64::from(s[at] - b'0') * 10 + i64::from(s[at + 1] - b'0');
         base + (two(8) - 1) * DAY + ((two(11) * 60 + two(14)) * 60 + two(17)) * 1000
     }
+    #[inline(always)]
     pub fn event(&self, s: &[u8]) -> i64 {
         if s.len() != 20 {
             return stamp(s);

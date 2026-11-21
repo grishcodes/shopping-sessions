@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn fingerprint_collisions_and_invalid_earliest() {
-        let (a, b) = (23901, 52826);
+        let (a, b) = (1_032_226_790_825, 1_038_169_220_971);
         assert_eq!(hash(a) >> 32, hash(b) >> 32);
         compare(&[]);
         compare(&[row(a, 1, 1)]);

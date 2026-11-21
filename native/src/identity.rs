@@ -1,3 +1,4 @@
+use super::fastmap::U64Map;
 use super::input::{Key, Keys, hash};
 use ahash::AHashMap;
 
@@ -12,7 +13,7 @@ pub fn shard_of(id: Key) -> usize {
 }
 
 pub struct Canon {
-    shards: Vec<AHashMap<Key, Key>>,
+    shards: Vec<U64Map<Key>>,
 }
 impl Canon {
     #[inline]
@@ -25,7 +26,7 @@ impl Canon {
     #[inline]
     pub fn get_shard(&self, shard: usize, id: Key) -> Option<Key> {
         debug_assert_eq!(shard_of(id), shard);
-        self.shards[shard].get(&id).copied()
+        self.shards[shard].get(id)
     }
 
     #[inline]
@@ -102,8 +103,13 @@ pub(super) fn build(edges: Vec<Vec<(Key, Key)>>, keys: &Keys) -> Canon {
         *value != id
     });
     // Split the map into cache-sized shards by the raw user ID.
-    let mut shards: Vec<AHashMap<Key, Key>> = (0..CANON_SHARDS)
-        .map(|_| AHashMap::new())
+    let mut sizes = vec![0usize; CANON_SHARDS];
+    for &id in indices.keys() {
+        sizes[shard_of(id)] += 1;
+    }
+    let mut shards: Vec<U64Map<Key>> = sizes
+        .iter()
+        .map(|&n| U64Map::with_capacity(n, 0))
         .collect();
     for (id, canon) in indices {
         shards[shard_of(id)].insert(id, canon);

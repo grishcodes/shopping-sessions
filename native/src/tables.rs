@@ -657,13 +657,13 @@ fn fused_people(
     if total_events == 0 {
         return;
     }
-    let mut ids: AHashMap<Key, u32> = AHashMap::with_capacity(total_events / 30);
+    let mut ids = crate::fastmap::U64Map::<u32>::with_capacity(total_events / 30, 0);
     let mut people: Vec<Key> = Vec::new();
     let mut event_counts: Vec<usize> = Vec::new();
     let mut event_ordinals: Vec<u32> = Vec::with_capacity(total_events);
     for part in &event_parts {
         for event in part {
-            let group = *ids.entry(event.user).or_insert_with(|| {
+            let (group, _) = ids.entry(event.user, || {
                 let group =
                     u32::try_from(event_counts.len()).expect("too many people in one shard");
                 assert_ne!(group, NO_EVENTS);
@@ -680,7 +680,7 @@ fn fused_people(
     let mut click_ordinals: Vec<u32> = Vec::with_capacity(total_clicks);
     for part in &click_parts {
         for click in part {
-            let group = ids.get(&click.user).copied().unwrap_or(NO_EVENTS);
+            let group = ids.get(click.user).unwrap_or(NO_EVENTS);
             if group != NO_EVENTS {
                 click_counts[group as usize] += 1;
             }

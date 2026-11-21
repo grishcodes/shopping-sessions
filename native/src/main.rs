@@ -1,6 +1,7 @@
 mod clockfast;
 mod compact;
 mod dedup;
+mod fastmap;
 mod fastrows;
 mod identity;
 mod input;
