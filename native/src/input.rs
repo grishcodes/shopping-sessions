@@ -1,5 +1,6 @@
+pub use crate::scan::rows;
 use ahash::AHashMap;
-use memchr::{memchr, memchr_iter};
+use memchr::memchr;
 use memmap2::Mmap;
 use std::{
     fs::{self, File},
@@ -26,6 +27,28 @@ impl Keys {
     pub fn id(&self, s: &[u8]) -> Key {
         if s.is_empty() {
             return 0;
+        }
+        if s.len() == 9 && s[0] > 0 && s[0] < 128 {
+            let bytes = u64::from_be_bytes(s[1..].try_into().unwrap());
+            let high = 0x8080_8080_8080_8080;
+            let zeros = bytes.wrapping_sub(0x0101_0101_0101_0101) & !bytes & high;
+            if bytes & high == 0 && zeros == 0 {
+                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                {
+                    // PEXT retains the seven payload bits in each byte in order.
+                    let payload = unsafe { std::arch::x86_64::_pext_u64(bytes, !high) };
+                    return (u64::from(s[0]) << 56) | payload;
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+                {
+                    // Remove each byte's zero high bit, then combine pairs, quads and octets.
+                    let pairs =
+                        (bytes & 0x007f_007f_007f_007f) | ((bytes & 0x7f00_7f00_7f00_7f00) >> 1);
+                    let quads =
+                        (pairs & 0x0000_3fff_0000_3fff) | ((pairs & 0x3fff_0000_3fff_0000) >> 2);
+                    return (u64::from(s[0]) << 56) | (quads & 0x0fff_ffff) | ((quads >> 32) << 28);
+                }
+            }
         }
         if s.len() <= 9 {
             let mut value = 0u64;
@@ -108,36 +131,6 @@ impl Files {
         chunks
     }
 }
-#[inline]
-pub fn rows<const N: usize>(chunk: &[u8], mut visit: impl FnMut([&[u8]; N])) {
-    let mut start = 0;
-    for end in memchr_iter(b'\n', chunk).chain(std::iter::once(chunk.len())) {
-        if end > start {
-            let line = &chunk[start..end];
-            let mut fields = [b"".as_slice(); N];
-            let mut it = line.split(|&c| c == b',');
-            let mut valid = true;
-            for field in &mut fields {
-                let Some(mut value) = it.next() else {
-                    valid = false;
-                    break;
-                };
-                if value.len() >= 2 && value[0] == b'"' && value.last() == Some(&b'"') {
-                    value = &value[1..value.len() - 1];
-                }
-                if value.contains(&b'"') {
-                    valid = false;
-                    break;
-                }
-                *field = value;
-            }
-            if valid && it.next().is_none() {
-                visit(fields);
-            }
-        }
-        start = end + 1;
-    }
-}
 pub fn dimension(path: &Path, mut visit: impl FnMut(&[u8], &[u8])) -> io::Result<()> {
     let bytes = fs::read(path)?;
     if let Some(header) = memchr(b'\n', &bytes) {
@@ -148,6 +141,16 @@ pub fn dimension(path: &Path, mut visit: impl FnMut(&[u8], &[u8])) -> io::Result
 pub fn digits(s: &[u8], limit: i64) -> i64 {
     if s.is_empty() {
         return BAD;
+    }
+    if s.len() <= 18 {
+        let mut value = 0i64;
+        let mut valid = true;
+        for &b in s {
+            let digit = b.wrapping_sub(b'0');
+            valid &= digit < 10;
+            value = value.wrapping_mul(10).wrapping_add(i64::from(digit));
+        }
+        return if valid && value <= limit { value } else { BAD };
     }
     let mut value = 0;
     for &b in s {
@@ -234,4 +237,56 @@ pub fn hash(mut x: Key) -> u64 {
     x ^= x >> 27;
     x = x.wrapping_mul(0x94d049bb133111eb);
     x ^ (x >> 31)
+}
+
+// Ingest timestamps are guaranteed to be valid UTC whole seconds. Cache the
+// window's starting month while retaining the general parser for other months.
+pub struct Month {
+    pub(crate) prefix: [u8; 8],
+    pub(crate) base: i64,
+    pub(crate) length: i64,
+}
+impl Month {
+    pub fn from_start(s: &[u8]) -> Self {
+        let mut first = *b"2000-01-01T00:00:00Z";
+        first[..8].copy_from_slice(&s[..8]);
+        let base = stamp(&first);
+        first[8..10].copy_from_slice(b"31");
+        let length = if stamp(&first) != BAD {
+            31
+        } else {
+            first[8..10].copy_from_slice(b"30");
+            if stamp(&first) != BAD {
+                30
+            } else {
+                first[8..10].copy_from_slice(b"29");
+                if stamp(&first) != BAD { 29 } else { 28 }
+            }
+        };
+        Self {
+            prefix: s[..8].try_into().unwrap(),
+            base,
+            length,
+        }
+    }
+    pub fn ingest(&self, s: &[u8]) -> i64 {
+        if s.len() != 20 || s[..8] != self.prefix {
+            return stamp(s);
+        }
+        let two = |at: usize| i64::from(s[at] - b'0') * 10 + i64::from(s[at + 1] - b'0');
+        self.base + (two(8) - 1) * DAY + ((two(11) * 60 + two(14)) * 60 + two(17)) * 1000
+    }
+    pub fn event(&self, s: &[u8]) -> i64 {
+        if s.len() != 20 || s[..8] != self.prefix {
+            return stamp(s);
+        }
+        if s[10] != b'T' || s[13] != b':' || s[16] != b':' || s[19] != b'Z' {
+            return BAD;
+        }
+        let (d, h, m, sec) = (pair(s, 8), pair(s, 11), pair(s, 14), pair(s, 17));
+        if d == 0 || d > self.length || h >= 24 || m >= 60 || sec >= 60 {
+            return BAD;
+        }
+        self.base + (d - 1) * DAY + ((h * 60 + m) * 60 + sec) * 1000
+    }
 }

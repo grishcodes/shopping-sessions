@@ -2,7 +2,9 @@
 
 The default engine reads UTF-8 CSV shards directly into typed Rust records, resolves linked IDs, selects the earliest copy of each event, and writes the two daily Parquet tables. Campaign assists use merged seven-day click intervals. The image also includes a DuckDB reference implementation. Select it with `ENGINE=duckdb` or select Rust with `ENGINE=native`.
 
-To build the native executable locally, run `cargo build --release --locked --manifest-path native/Cargo.toml` with Rust 1.85 or newer. Set `DATA_DIR`, `OUTPUT_DIR` and `NCPU` before running `native/target/release/shopping-sessions`. Use an empty output directory for each run, as the scorer does. `PROFILE=1` prints cumulative elapsed time at each stage. `EVENT_DEDUP=sort` selects the default sort-based implementation and `EVENT_DEDUP=hash` selects the hash-table variant.
+To build the native executable locally, run `cargo build --release --locked --manifest-path native/Cargo.toml` with Rust 1.85 or newer. Set `DATA_DIR`, `OUTPUT_DIR` and `NCPU` before running `native/target/release/shopping-sessions`. Use an empty output directory for each run, as the scorer does. `PROFILE=1` prints cumulative elapsed time at each stage. The default deduplicator uses a per-shard bitmap to identify IDs that occur once and an exact ID lookup to resolve every possible collision. To compare algorithms, set `EVENT_DEDUP` to `singletons`, `sort`, `hash`, `radix`, or `compact-hash`.
+
+The default CSV scanner (`SHOPPING_SCAN=whole`) uses whole-row delimiter masks with a portable fallback. The `scalar` and `avx2` settings select the field-by-field and streaming-mask scanners. Set `PROFILE_MEMORY=1` to print buffer sizes at each repartition. `PARQUET_LAYOUT=compact` enables Parquet delta encodings for comparison with the default plain encoding.
 
 ## Local verification
 

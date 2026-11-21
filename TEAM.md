@@ -1,5 +1,5 @@
 # Team
 
-Name:
+Name: Drunken Coders
 Members:
-Engine: DuckDB
+Engine: Rust with a DuckDB reference implementation

@@ -4,9 +4,9 @@ use crate::{
 };
 use parquet::{
     data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type},
-    errors::Result,
+    errors::{ParquetError, Result},
     file::{
-        properties::{EnabledStatistics, WriterProperties},
+        properties::{EnabledStatistics, WriterProperties, WriterVersion},
         writer::{SerializedFileWriter, SerializedRowGroupWriter},
     },
     schema::parser::parse_message_type,
@@ -19,8 +19,26 @@ const CAMPAIGNS: &str = "message campaigns { REQUIRED BINARY campaign_id (UTF8);
  REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 purchasing_sessions; REQUIRED INT64 revenue_cents;
  REQUIRED INT64 assisted_sessions; }";
 
-fn file(path: &Path, schema: &str) -> Result<SerializedFileWriter<File>> {
+fn compact_layout() -> Result<bool> {
+    match std::env::var("PARQUET_LAYOUT").as_deref() {
+        Ok("compact") => Ok(true),
+        Ok("plain") | Err(std::env::VarError::NotPresent) => Ok(false),
+        _ => Err(ParquetError::General(
+            "PARQUET_LAYOUT must be plain or compact".into(),
+        )),
+    }
+}
+
+fn file(path: &Path, schema: &str, compact: bool) -> Result<SerializedFileWriter<File>> {
+    // With dictionaries disabled, parquet 54 uses delta binary packing for
+    // integer/date columns and delta byte arrays for UTF-8 in its v2 writer.
+    let version = if compact {
+        WriterVersion::PARQUET_2_0
+    } else {
+        WriterVersion::PARQUET_1_0
+    };
     let properties = WriterProperties::builder()
+        .set_writer_version(version)
         .set_statistics_enabled(EnabledStatistics::None)
         .set_dictionary_enabled(false)
         .build();
@@ -43,21 +61,43 @@ fn column<D: DataType>(
 fn string(names: &Names, id: Key) -> ByteArray {
     ByteArray::from(names.bytes(id, &mut [0; 9]).to_vec())
 }
+fn user_names(batch: &[UserDay], names: &Names) -> Vec<ByteArray> {
+    // Successive days of one person are contiguous. Store each name once in
+    // this row group's backing buffer. Slices retain it until the writer is done.
+    let mut bytes = Vec::with_capacity(batch.len() * 9);
+    let mut groups = Vec::new();
+    for group in batch.chunk_by(|a, b| a.user == b.user) {
+        bytes.extend_from_slice(names.bytes(group[0].user, &mut [0; 9]));
+        groups.push((bytes.len(), group.len()));
+    }
+    let buffer = ByteArray::from(bytes);
+    let mut start = 0;
+    let mut values = Vec::with_capacity(batch.len());
+    for (end, count) in groups {
+        let value = buffer.slice(start, end - start);
+        values.extend(std::iter::repeat_n(value, count));
+        start = end;
+    }
+    values
+}
+
 pub fn users(
     path: &Path,
     shards: &[Vec<UserDay>],
     names: &Names,
     categories: &[Key],
 ) -> Result<()> {
-    let mut out = file(path, USERS)?;
+    let compact = compact_layout()?;
+    let mut out = file(path, USERS, compact)?;
     let labels: Vec<_> = categories.iter().map(|&k| string(names, k)).collect();
     for batch in shards.iter().flat_map(|rows| rows.chunks(65536)) {
         let mut g = out.next_row_group()?;
-        column::<ByteArrayType>(
-            &mut g,
-            batch.iter().map(|r| string(names, r.user)).collect(),
-            None,
-        )?;
+        let ids = if compact {
+            user_names(batch, names)
+        } else {
+            batch.iter().map(|r| string(names, r.user)).collect()
+        };
+        column::<ByteArrayType>(&mut g, ids, None)?;
         column::<Int32Type>(&mut g, batch.iter().map(|r| r.day).collect(), None)?;
         column::<Int64Type>(&mut g, batch.iter().map(|r| r.sessions).collect(), None)?;
         column::<Int64Type>(&mut g, batch.iter().map(|r| r.events).collect(), None)?;
@@ -82,7 +122,7 @@ pub fn campaigns(
     names: &Names,
     labels: &[(Key, Key)],
 ) -> Result<()> {
-    let mut out = file(path, CAMPAIGNS)?;
+    let mut out = file(path, CAMPAIGNS, compact_layout()?)?;
     let rows: Vec<_> = days.into_iter().collect();
     if !rows.is_empty() {
         let mut g = out.next_row_group()?;

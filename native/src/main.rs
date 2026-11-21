@@ -1,5 +1,11 @@
+mod clockfast;
+mod dedup;
+mod fastrows;
+mod identity;
 mod input;
 mod output;
+mod scan;
+mod singletons;
 mod tables;
 use ahash::AHashMap;
 use input::{BAD, DAY, Files, Key, Keys, WEEK, hash, rows, stamp};
@@ -14,57 +20,6 @@ use tables::{CampaignDays, Click, Event};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const SHARDS: usize = 128;
 
-#[derive(Default)]
-struct Links {
-    ids: AHashMap<Key, usize>,
-    parents: Vec<usize>,
-    sizes: Vec<usize>,
-}
-impl Links {
-    fn index(&mut self, id: Key) -> usize {
-        let n = self.parents.len();
-        *self.ids.entry(id).or_insert_with(|| {
-            self.parents.push(n);
-            self.sizes.push(1);
-            n
-        })
-    }
-    fn root(&mut self, mut i: usize) -> usize {
-        while self.parents[i] != i {
-            self.parents[i] = self.parents[self.parents[i]];
-            i = self.parents[i];
-        }
-        i
-    }
-    fn join(&mut self, a: Key, b: Key) {
-        let (a, b) = (self.index(a), self.index(b));
-        let (mut a, mut b) = (self.root(a), self.root(b));
-        if a != b {
-            if self.sizes[a] < self.sizes[b] {
-                std::mem::swap(&mut a, &mut b)
-            }
-            self.parents[b] = a;
-            self.sizes[a] += self.sizes[b];
-        }
-    }
-    fn canonical(mut self, keys: &Keys) -> AHashMap<Key, Key> {
-        let names = keys.names();
-        let ids = std::mem::take(&mut self.ids);
-        let mut minimum = vec![0; ids.len()];
-        for (&id, &idx) in &ids {
-            let best = &mut minimum[self.root(idx)];
-            if *best == 0 || names.less(id, *best) {
-                *best = id
-            }
-        }
-        ids.into_iter()
-            .filter_map(|(id, idx)| {
-                let name = minimum[self.root(idx)];
-                (id != name).then_some((id, name))
-            })
-            .collect()
-    }
-}
 fn link_map(data: &Path, keys: &Keys) -> Result<AHashMap<Key, Key>> {
     let files = Files::open(&data.join("links"))?;
     let chunks = files.chunks();
@@ -80,14 +35,33 @@ fn link_map(data: &Path, keys: &Keys) -> Result<AHashMap<Key, Key>> {
             edges
         })
         .collect();
-    let mut links = Links::default();
-    for (a, b) in edges.into_iter().flatten() {
-        links.join(a, b)
-    }
-    Ok(links.canonical(keys))
+    Ok(identity::build(edges, keys))
 }
 fn buckets<T>() -> Vec<Vec<T>> {
     (0..SHARDS).map(|_| Vec::new()).collect()
+}
+// Size the initial buffers from input bytes. Rows wider or shorter than the
+// estimate use normal Vec growth. The estimate never affects field validation.
+fn reserved_buckets<T>(rows: usize) -> Vec<Vec<T>> {
+    (0..SHARDS)
+        .map(|_| Vec::with_capacity(rows.div_ceil(SHARDS)))
+        .collect()
+}
+fn report_buffers<T>(label: &str, blocks: &[Vec<Vec<T>>]) {
+    if env::var_os("PROFILE_MEMORY").is_some() {
+        let (mut used, mut capacity, mut fragments) = (0, 0, 0);
+        for part in blocks.iter().flatten() {
+            used += part.len();
+            capacity += part.capacity();
+            fragments += usize::from(part.capacity() > 0);
+        }
+        let width = std::mem::size_of::<T>();
+        eprintln!(
+            "{label} live_bytes={} capacity_bytes={} allocated_buffers={fragments}",
+            used * width,
+            capacity * width
+        );
+    }
 }
 fn redistribute<T>(blocks: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
     let mut shards = buckets();
@@ -117,18 +91,25 @@ struct CopyOfEvent {
     event: Event,
 }
 fn winners(
-    mut copies: Vec<CopyOfEvent>,
-    hashed: bool,
+    parts: Vec<Vec<CopyOfEvent>>,
+    mode: &str,
     canon: &AHashMap<Key, Key>,
 ) -> Vec<Vec<Event>> {
-    let mut out = buckets();
+    let mut out = reserved_buckets(parts.iter().map(Vec::len).sum());
     let mut emit = |mut e: Event| {
         if e.ts != BAD {
             e.user = *canon.get(&e.user).unwrap_or(&e.user);
             out[shard(e.user)].push(e);
         }
     };
-    if hashed {
+    if mode == "singletons" {
+        singletons::select(&parts, emit);
+        return out;
+    }
+    let mut copies = gather(parts);
+    if matches!(mode, "radix" | "compact-hash") {
+        dedup::select(&copies, mode, emit);
+    } else if mode == "hash" {
         let mut index = AHashMap::with_capacity(copies.len());
         for row in copies {
             let winner = index.entry(row.id).or_insert(row);
@@ -173,6 +154,7 @@ fn run() -> Result<()> {
         Ok(ts)
     };
     let (lo, hi) = (timestamp("window_start")?, timestamp("window_end")?);
+    let month = input::Month::from_start(manifest["window_start"].as_str().unwrap().as_bytes());
     let threads = env::var("NCPU")
         .unwrap_or_else(|_| "8".into())
         .parse::<usize>()?
@@ -201,102 +183,121 @@ fn run() -> Result<()> {
         campaigns.insert(id, campaign_names.len() as u32);
         campaign_names.push((id, keys.id(channel)));
     })?;
-    let canon = link_map(&data, &keys)?;
-    mark("dimensions and identities");
     let events = Files::open(&data.join("events"))?;
-    let parsed: Vec<_> = events
-        .chunks()
-        .into_par_iter()
-        .map(|chunk| {
-            let mut parts = buckets();
-            rows(chunk, |[id, user, ts, ingest, kind, product, price]| {
-                if id.is_empty() {
-                    return;
-                }
-                let id = keys.id(id);
-                let ts = stamp(ts);
-                let ingest = stamp(ingest);
-                let purchase = kind == b"purchase";
-                let price = if purchase {
-                    input::digits(price, 10_000_000)
-                } else {
-                    0
-                };
-                let valid = ts >= lo
-                    && ts < hi
-                    && !user.is_empty()
-                    && !product.is_empty()
-                    && (kind == b"view" || kind == b"cart" || purchase && price > 0)
-                    && ingest != BAD
-                    && ingest - ts <= DAY;
-                let event = if valid {
-                    let category = if purchase {
-                        *products.get(&keys.id(product)).unwrap_or(&0)
-                    } else {
-                        0
-                    };
-                    Event {
-                        user: keys.id(user),
-                        ts,
-                        price: price as u32,
-                        category,
+    let group_size = env::var("INPUT_GROUP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+        .max(1);
+    let (canon, parsed) = rayon::join(
+        || link_map(&data, &keys),
+        || {
+            events
+                .chunks()
+                .par_chunks(group_size)
+                .map(|group| {
+                    let mut parts =
+                        reserved_buckets(group.iter().map(|c| c.len()).sum::<usize>() / 80);
+                    for chunk in group {
+                        rows(chunk, |[id, user, ts, ingest, kind, product, price]| {
+                            if id.is_empty() {
+                                return;
+                            }
+                            let id = keys.id(id);
+                            let ts = clockfast::event(&month, ts);
+                            let ingest = month.ingest(ingest);
+                            let purchase = kind == b"purchase";
+                            let price = if purchase {
+                                input::digits(price, 10_000_000)
+                            } else {
+                                0
+                            };
+                            let valid = ts >= lo
+                                && ts < hi
+                                && !user.is_empty()
+                                && !product.is_empty()
+                                && (kind == b"view" || kind == b"cart" || purchase && price > 0)
+                                && ingest != BAD
+                                && ingest - ts <= DAY;
+                            let event = if valid {
+                                let category = if purchase {
+                                    *products.get(&keys.id(product)).unwrap_or(&0)
+                                } else {
+                                    0
+                                };
+                                Event {
+                                    user: keys.id(user),
+                                    ts,
+                                    price: price as u32,
+                                    category,
+                                }
+                            } else {
+                                Event {
+                                    user: 0,
+                                    ts: BAD,
+                                    price: 0,
+                                    category: 0,
+                                }
+                            };
+                            parts[shard(id)].push(CopyOfEvent { id, ingest, event });
+                        });
                     }
-                } else {
-                    Event {
-                        user: 0,
-                        ts: BAD,
-                        price: 0,
-                        category: 0,
-                    }
-                };
-                parts[shard(id)].push(CopyOfEvent { id, ingest, event });
-            });
-            parts
-        })
-        .collect();
+                    parts
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    let canon = canon?;
     drop(events);
-    mark("parsed events");
-    let hashed = match env::var("EVENT_DEDUP").as_deref() {
-        Ok("hash") => true,
-        Ok("sort") | Err(_) => false,
-        Ok(_) => return Err("unknown EVENT_DEDUP".into()),
-    };
+    mark("parsed events and resolved identities");
+    let mode = env::var("EVENT_DEDUP").unwrap_or_else(|_| "singletons".into());
+    if !matches!(
+        mode.as_str(),
+        "sort" | "hash" | "radix" | "compact-hash" | "singletons"
+    ) {
+        return Err("unknown EVENT_DEDUP".into());
+    }
+    report_buffers("event copies", &parsed);
     let events = redistribute(
         redistribute(parsed)
             .into_par_iter()
-            .map(|parts| winners(gather(parts), hashed, &canon))
+            .map(|parts| winners(parts, &mode, &canon))
             .collect(),
     );
+    report_buffers("linked events", &events);
     mark("deduplicated and linked events");
     let clicks = Files::open(&data.join("clicks"))?;
     let ads: Vec<_> = clicks
         .chunks()
-        .into_par_iter()
-        .map(|chunk| {
-            let mut parts = buckets();
-            rows(chunk, |[id, user, campaign, ts]| {
-                if id.is_empty() || user.is_empty() {
-                    return;
-                }
-                let ts = stamp(ts);
-                if ts < lo - WEEK || ts >= hi {
-                    return;
-                }
-                let Some(&campaign) = campaigns.get(&keys.id(campaign)) else {
-                    return;
-                };
-                let user = keys.id(user);
-                let user = *canon.get(&user).unwrap_or(&user);
-                parts[shard(user)].push(Click {
-                    user,
-                    ts,
-                    id: keys.id(id),
-                    campaign,
+        .par_chunks(group_size)
+        .map(|group| {
+            let mut parts = reserved_buckets(group.iter().map(|c| c.len()).sum::<usize>() / 48);
+            for chunk in group {
+                rows(chunk, |[id, user, campaign, ts]| {
+                    if id.is_empty() || user.is_empty() {
+                        return;
+                    }
+                    let ts = clockfast::event(&month, ts);
+                    if ts < lo - WEEK || ts >= hi {
+                        return;
+                    }
+                    let Some(&campaign) = campaigns.get(&keys.id(campaign)) else {
+                        return;
+                    };
+                    let user = keys.id(user);
+                    let user = *canon.get(&user).unwrap_or(&user);
+                    parts[shard(user)].push(Click {
+                        user,
+                        ts,
+                        id: keys.id(id),
+                        campaign,
+                    });
                 });
-            });
+            }
             parts
         })
         .collect();
+    report_buffers("clicks", &ads);
     drop(clicks);
     drop(canon);
     mark("parsed clicks");
