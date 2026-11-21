@@ -515,6 +515,20 @@ fn run() -> Result<()> {
     if profile {
         // CPU time actually consumed (user+sys), robust to a loaded box.
         eprintln!("cpu {:.3}", cpu_now());
+        // Deterministic fault count plus the user/sys split from the kernel,
+        // for A/B runs on machines without /usr/bin/time.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0 {
+            let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+            eprintln!(
+                "rusage minflt {} majflt {} user {:.3} sys {:.3} maxrss_kb {}",
+                ru.ru_minflt,
+                ru.ru_majflt,
+                secs(ru.ru_utime),
+                secs(ru.ru_stime),
+                ru.ru_maxrss
+            );
+        }
     }
     // Skip dropping the large buffers and mappings: the OS reclaims them
     // on exit, and the scorer clocks container start to process exit.

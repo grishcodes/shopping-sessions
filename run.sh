@@ -12,6 +12,15 @@ case "${ENGINE:-native}" in
         # Let mimalloc back its heap with large OS pages when available;
         # falls back silently when huge pages are not configured.
         export MIMALLOC_LARGE_OS_PAGES="${MIMALLOC_LARGE_OS_PAGES-1}"
+        # Keep freed memory committed for reuse instead of returning it to
+        # the OS after a few ms: every stage frees large buffers that the
+        # next stage reallocates, and a purge makes each reuse take fresh
+        # first-touch page faults (kernel zeroing). Peak RSS is unchanged.
+        # mimalloc 2.0.x (the Debian bookworm libmimalloc2.0 in this image)
+        # reads MIMALLOC_ALLOW_DECOMMIT; 2.1+ reads MIMALLOC_PURGE_DELAY.
+        # Each version ignores the other's name. Override either to compare.
+        export MIMALLOC_ALLOW_DECOMMIT="${MIMALLOC_ALLOW_DECOMMIT-0}"
+        export MIMALLOC_PURGE_DELAY="${MIMALLOC_PURGE_DELAY--1}"
         # x86-64-v3 binary (AVX2/BMI2) when the run CPU supports it, else the
         # baseline build. Both are the same source; only codegen differs.
         if grep -q " avx2 " /proc/cpuinfo && grep -q " bmi2 " /proc/cpuinfo; then
