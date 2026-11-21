@@ -5,7 +5,12 @@ RUN rustc --edition=2024 -C opt-level=3 -o /normalize /src/normalize.rs
 WORKDIR /src/engine
 COPY native/Cargo.toml native/Cargo.lock ./
 COPY native/src/ src/
-RUN cargo build --release --locked
+RUN cargo build --release --locked && cp target/release/shopping-sessions /tmp/shopping-sessions-base
+# Second build for x86-64-v3 (AVX2/BMI2/popcnt): enables the PEXT path in
+# Keys::id and AVX2 auto-vectorization. RUSTFLAGS changes fingerprints, so
+# this rebuilds the crates (~2-3 min). run.sh picks the v3 binary only when
+# the run CPU supports it, falling back to the baseline otherwise.
+RUN RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked && cp target/release/shopping-sessions /tmp/shopping-sessions-v3
 
 FROM python:3.12-slim-bookworm
 
@@ -21,7 +26,8 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY pipeline/ /app/pipeline/
 COPY --from=normalizer /normalize /app/normalize
-COPY --from=normalizer /src/engine/target/release/shopping-sessions /app/shopping-sessions
+COPY --from=normalizer /tmp/shopping-sessions-base /app/shopping-sessions
+COPY --from=normalizer /tmp/shopping-sessions-v3 /app/shopping-sessions-v3
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh
 

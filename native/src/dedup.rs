@@ -1,4 +1,4 @@
-use super::{CopyOfEvent, input::hash, tables::Event};
+use super::{CopyOfEvent, input::hash, tables::RawEvent};
 
 #[derive(Clone, Copy, Default)]
 struct Index {
@@ -109,7 +109,7 @@ fn radix(copies: &[CopyOfEvent], discard: &mut [bool]) {
 
 /// Emit earliest ingests, including invalid winners. Emission preserves input
 /// order for locality when the caller canonicalizes and repartitions events.
-pub(super) fn select(copies: &[CopyOfEvent], mode: &str, mut emit: impl FnMut(Event)) {
+pub(super) fn select(copies: &[CopyOfEvent], mode: &str, mut emit: impl FnMut(RawEvent)) {
     assert!(
         copies.len() <= u32::MAX as usize,
         "shard exceeds 32-bit row index"
@@ -136,7 +136,7 @@ mod tests {
         CopyOfEvent {
             id,
             ingest,
-            event: Event {
+            event: RawEvent {
                 user: id,
                 ts,
                 price: 0,

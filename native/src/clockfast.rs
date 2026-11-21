@@ -52,9 +52,27 @@ pub fn event(month: &Month, s: &[u8]) -> i64 {
     if let Ok(digits) = <&[u8; 13]>::try_from(s) {
         return epoch_13(digits);
     }
-    if s.len() != 25 || s[..8] != month.prefix {
-        return month.event(s);
+    // F3 with leading zeros: strip them; exactly 13 digits left routes to
+    // the SWAR path. Anything non-digit still yields BAD from epoch_13,
+    // matching the general digits() path.
+    if s.len() > 13 {
+        let mut i = 0;
+        while i < s.len() && s[i] == b'0' {
+            i += 1;
+        }
+        if s.len() - i == 13 {
+            if let Ok(digits) = <&[u8; 13]>::try_from(&s[i..]) {
+                return epoch_13(digits);
+            }
+        }
     }
+    let Some((base, length)) = (if s.len() == 25 {
+        month.base_len(&s[..8])
+    } else {
+        None
+    }) else {
+        return month.event(s);
+    };
     if s[10] != b'T' || s[13] != b':' || s[16] != b':' || s[22] != b':' {
         return BAD;
     }
@@ -65,7 +83,7 @@ pub fn event(month: &Month, s: &[u8]) -> i64 {
     let offset_hour = pair(s, 20);
     let offset_minute = pair(s, 23);
     if day == 0
-        || i64::from(day) > month.length
+        || i64::from(day) > length
         || hour >= 24
         || minute >= 60
         || second >= 60
@@ -81,7 +99,7 @@ pub fn event(month: &Month, s: &[u8]) -> i64 {
         _ => return BAD,
     };
     let minutes = i64::from(hour * 60 + minute) - offset;
-    month.base + (i64::from(day) - 1) * DAY + (minutes * 60 + i64::from(second)) * 1000
+    base + (i64::from(day) - 1) * DAY + (minutes * 60 + i64::from(second)) * 1000
 }
 
 #[cfg(test)]
@@ -122,6 +140,74 @@ mod tests {
                 check(month, input);
             }
         }
+    }
+
+    #[test]
+    fn second_month_and_leading_zero_f3_match_general_parser() {
+        // Window starting Feb 20 straddles into March (second cached month).
+        let month = Month::from_start(b"2028-02-20T00:00:00Z");
+        for input in [
+            b"2028-03-01T00:00:00Z".as_slice(),
+            b"2028-03-31T23:59:59Z",
+            b"2028-03-01T00:00:00+01:00",
+            b"2028-03-31T23:59:59-23:59",
+            b"2028-03-32T00:00:00Z",
+            b"2028-02-29T23:59:59Z",
+            b"2028-04-01T00:00:00Z",
+            b"0001791071890000",
+            b"00000000000001791071890000",
+            b"0000000000000000000000000",
+            b"0000000000000000000000001",
+            b"0000000000000a",
+        ] {
+            check(&month, input);
+        }
+        // December -> January year rollover for the second month.
+        let dec = Month::from_start(b"2028-12-20T00:00:00Z");
+        for input in [
+            b"2029-01-01T00:00:00Z".as_slice(),
+            b"2029-01-31T23:59:59Z",
+            b"2029-01-31T23:59:59+05:30",
+            b"2029-02-01T00:00:00Z",
+            b"2028-12-31T23:59:59Z",
+        ] {
+            check(&dec, input);
+        }
+    }
+
+    /// Timing probe, not a correctness test: reads a one-ts-per-line corpus
+    /// from $TS_CORPUS with window start $TS_START and prints ns/parse.
+    /// Skipped unless TS_CORPUS is set. Run with --nocapture.
+    #[test]
+    fn bench_ts_corpus() {
+        let Ok(path) = std::env::var("TS_CORPUS") else {
+            return;
+        };
+        let start = std::env::var("TS_START").unwrap();
+        let raw = std::fs::read(path).unwrap();
+        let lines: Vec<&[u8]> = raw
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        let month = Month::from_start(start.as_bytes());
+        let mut sink: i64 = 0;
+        for line in &lines {
+            sink = sink.wrapping_add(event(&month, line));
+        }
+        let iters = 50;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for line in &lines {
+                sink = sink.wrapping_add(event(&month, line));
+            }
+        }
+        let el = t0.elapsed();
+        let total = lines.len() as u128 * iters as u128;
+        eprintln!(
+            "TSBENCH parses={total} secs={:.3} ns_per_parse={:.2} sink={sink}",
+            el.as_secs_f64(),
+            el.as_nanos() as f64 / total as f64
+        );
     }
 
     #[test]

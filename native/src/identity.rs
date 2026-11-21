@@ -1,5 +1,43 @@
-use super::input::{Key, Keys};
+use super::input::{Key, Keys, hash};
 use ahash::AHashMap;
+
+// The canonical map is large (millions of entries at 20M) and every event
+// and click does a random lookup into it. Split it by the raw user ID into
+// 128 small maps, each fitting in L2, so lookups hit cache instead of DRAM.
+pub const CANON_SHARDS: usize = 128;
+
+#[inline]
+pub fn shard_of(id: Key) -> usize {
+    hash(id) as usize & (CANON_SHARDS - 1)
+}
+
+pub struct Canon {
+    shards: Vec<AHashMap<Key, Key>>,
+}
+impl Canon {
+    #[inline]
+    pub fn get(&self, id: Key) -> Option<Key> {
+        self.get_shard(shard_of(id), id)
+    }
+
+    // Look up only the named shard. Callers that grouped keys by
+    // shard_of(id) first keep that shard's table in L2 across the whole group.
+    #[inline]
+    pub fn get_shard(&self, shard: usize, id: Key) -> Option<Key> {
+        debug_assert_eq!(shard_of(id), shard);
+        self.shards[shard].get(&id).copied()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    #[inline]
+    pub fn contains_key(&self, id: Key) -> bool {
+        self.get(id).is_some()
+    }
+}
 
 // Non-roots point to their dense parent index. Roots store minus their size.
 fn root(parents: &mut [isize], mut i: usize) -> usize {
@@ -29,7 +67,7 @@ fn index(
     }) as usize
 }
 
-pub(super) fn build(edges: Vec<Vec<(Key, Key)>>, keys: &Keys) -> AHashMap<Key, Key> {
+pub(super) fn build(edges: Vec<Vec<(Key, Key)>>, keys: &Keys) -> Canon {
     let edge_count: usize = edges.iter().map(Vec::len).sum();
     let expected_ids = edge_count + edge_count / 2;
     let mut indices = AHashMap::with_capacity(expected_ids);
@@ -63,7 +101,14 @@ pub(super) fn build(edges: Vec<Vec<(Key, Key)>>, keys: &Keys) -> AHashMap<Key, K
         *value = minimum[root(&mut parents, *value as usize)];
         *value != id
     });
-    indices
+    // Split the map into cache-sized shards by the raw user ID.
+    let mut shards: Vec<AHashMap<Key, Key>> = (0..CANON_SHARDS)
+        .map(|_| AHashMap::new())
+        .collect();
+    for (id, canon) in indices {
+        shards[shard_of(id)].insert(id, canon);
+    }
+    Canon { shards }
 }
 
 #[cfg(test)]
@@ -89,10 +134,10 @@ mod tests {
         );
         assert_eq!(connected.len(), 4);
         for id in [z, za, old, unicode] {
-            assert_eq!(connected.get(&id), Some(&nul));
+            assert_eq!(connected.get(id), Some(nul));
         }
-        assert!(!connected.contains_key(&solo));
-        assert!(!connected.contains_key(&nul));
+        assert!(!connected.contains_key(solo));
+        assert!(!connected.contains_key(nul));
     }
 
     #[test]
@@ -160,7 +205,7 @@ mod tests {
             let actual = build(blocks, &keys);
             assert_eq!(actual.len(), expected.len());
             for (id, canonical) in &expected {
-                assert_eq!(actual.get(id), Some(canonical));
+                assert_eq!(actual.get(*id), Some(*canonical));
             }
         }
     }

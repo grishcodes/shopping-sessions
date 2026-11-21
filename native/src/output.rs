@@ -1,6 +1,6 @@
 use crate::{
     input::{Key, Names},
-    tables::{CampaignDays, UserDay},
+    tables::{Credit, UserDay},
 };
 use parquet::{
     data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type},
@@ -92,11 +92,10 @@ pub fn users(
     let labels: Vec<_> = categories.iter().map(|&k| string(names, k)).collect();
     for batch in shards.iter().flat_map(|rows| rows.chunks(65536)) {
         let mut g = out.next_row_group()?;
-        let ids = if compact {
-            user_names(batch, names)
-        } else {
-            batch.iter().map(|r| string(names, r.user)).collect()
-        };
+        // Shared-buffer names for both layouts: one backing buffer per row
+        // group, slices retain it until the writer is done. Avoids a
+        // per-row ByteArray allocation (a to_vec copy) for every user.
+        let ids = user_names(batch, names);
         column::<ByteArrayType>(&mut g, ids, None)?;
         column::<Int32Type>(&mut g, batch.iter().map(|r| r.day).collect(), None)?;
         column::<Int64Type>(&mut g, batch.iter().map(|r| r.sessions).collect(), None)?;
@@ -118,12 +117,24 @@ pub fn users(
 }
 pub fn campaigns(
     path: &Path,
-    days: CampaignDays,
+    days: Vec<Credit>,
+    day0: i32,
+    n_days: usize,
     names: &Names,
     labels: &[(Key, Key)],
 ) -> Result<()> {
     let mut out = file(path, CAMPAIGNS, compact_layout()?)?;
-    let rows: Vec<_> = days.into_iter().collect();
+    // One row per (campaign, day) with at least one credited session or one
+    // assist. Iterate campaigns and days in order for a deterministic file.
+    let mut rows: Vec<((u32, i32), Credit)> = Vec::new();
+    for i in 0..labels.len() {
+        for d in 0..n_days {
+            let c = days[i * n_days + d];
+            if c.sessions > 0 || c.assists > 0 {
+                rows.push(((i as u32, day0 + d as i32), c));
+            }
+        }
+    }
     if !rows.is_empty() {
         let mut g = out.next_row_group()?;
         for field in [0, 1] {

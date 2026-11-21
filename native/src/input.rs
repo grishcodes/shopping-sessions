@@ -107,7 +107,25 @@ impl Files {
             let f = File::open(path)?;
             if f.metadata()?.len() != 0 {
                 // Scorer inputs stay read-only for the lifetime of the map.
-                maps.push(unsafe { Mmap::map(&f)? });
+                let map = unsafe { Mmap::map(&f)? };
+                // Best-effort: start async readahead of the whole file now
+                // (later files get read while earlier ones parse) and hint
+                // for huge pages to cut TLB misses on first touch. The
+                // kernel may ignore either; errors are not fatal.
+                #[cfg(unix)]
+                unsafe {
+                    libc::madvise(
+                        map.as_ptr() as *mut libc::c_void,
+                        map.len(),
+                        libc::MADV_WILLNEED,
+                    );
+                    libc::madvise(
+                        map.as_ptr() as *mut libc::c_void,
+                        map.len(),
+                        libc::MADV_HUGEPAGE,
+                    );
+                }
+                maps.push(map);
             }
         }
         Ok(Self(maps))
@@ -245,6 +263,12 @@ pub struct Month {
     pub(crate) prefix: [u8; 8],
     pub(crate) base: i64,
     pub(crate) length: i64,
+    // Second month: the window is 14 days, so it can straddle a month
+    // boundary and ~half the rows then fall in the next month. Cache it
+    // too, so those rows keep the base+offset path instead of stamp().
+    pub(crate) prefix2: [u8; 8],
+    pub(crate) base2: i64,
+    pub(crate) length2: i64,
 }
 impl Month {
     pub fn from_start(s: &[u8]) -> Self {
@@ -263,30 +287,81 @@ impl Month {
                 if stamp(&first) != BAD { 29 } else { 28 }
             }
         };
+        // Next month: same stamp-trial for its length, base follows directly.
+        let y = i64::from(s[0] - b'0') * 1000
+            + i64::from(s[1] - b'0') * 100
+            + i64::from(s[2] - b'0') * 10
+            + i64::from(s[3] - b'0');
+        let m = i64::from(s[5] - b'0') * 10 + i64::from(s[6] - b'0');
+        let (y2, m2) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        let mut prefix2 = *b"2000-01-";
+        prefix2[0] = b'0' + (y2 / 1000) as u8;
+        prefix2[1] = b'0' + ((y2 / 100) % 10) as u8;
+        prefix2[2] = b'0' + ((y2 / 10) % 10) as u8;
+        prefix2[3] = b'0' + (y2 % 10) as u8;
+        prefix2[5] = b'0' + (m2 / 10) as u8;
+        prefix2[6] = b'0' + (m2 % 10) as u8;
+        let base2 = base + length * DAY;
+        let mut second = *b"2000-01-01T00:00:00Z";
+        second[..8].copy_from_slice(&prefix2);
+        second[8..10].copy_from_slice(b"31");
+        let length2 = if stamp(&second) != BAD {
+            31
+        } else {
+            second[8..10].copy_from_slice(b"30");
+            if stamp(&second) != BAD {
+                30
+            } else {
+                second[8..10].copy_from_slice(b"29");
+                if stamp(&second) != BAD { 29 } else { 28 }
+            }
+        };
         Self {
             prefix: s[..8].try_into().unwrap(),
             base,
             length,
+            prefix2,
+            base2,
+            length2,
+        }
+    }
+    /// (base, length) for the month whose `YYYY-MM-` prefix matches, if either
+    /// cached month does.
+    pub(crate) fn base_len(&self, prefix: &[u8]) -> Option<(i64, i64)> {
+        if prefix == self.prefix {
+            Some((self.base, self.length))
+        } else if prefix == self.prefix2 {
+            Some((self.base2, self.length2))
+        } else {
+            None
         }
     }
     pub fn ingest(&self, s: &[u8]) -> i64 {
-        if s.len() != 20 || s[..8] != self.prefix {
+        if s.len() != 20 {
             return stamp(s);
         }
+        let base = match self.base_len(&s[..8]) {
+            Some((base, _)) => base,
+            None => return stamp(s),
+        };
         let two = |at: usize| i64::from(s[at] - b'0') * 10 + i64::from(s[at + 1] - b'0');
-        self.base + (two(8) - 1) * DAY + ((two(11) * 60 + two(14)) * 60 + two(17)) * 1000
+        base + (two(8) - 1) * DAY + ((two(11) * 60 + two(14)) * 60 + two(17)) * 1000
     }
     pub fn event(&self, s: &[u8]) -> i64 {
-        if s.len() != 20 || s[..8] != self.prefix {
+        if s.len() != 20 {
             return stamp(s);
         }
+        let (base, length) = match self.base_len(&s[..8]) {
+            Some(v) => v,
+            None => return stamp(s),
+        };
         if s[10] != b'T' || s[13] != b':' || s[16] != b':' || s[19] != b'Z' {
             return BAD;
         }
         let (d, h, m, sec) = (pair(s, 8), pair(s, 11), pair(s, 14), pair(s, 17));
-        if d == 0 || d > self.length || h >= 24 || m >= 60 || sec >= 60 {
+        if d == 0 || d > length || h >= 24 || m >= 60 || sec >= 60 {
             return BAD;
         }
-        self.base + (d - 1) * DAY + ((h * 60 + m) * 60 + sec) * 1000
+        base + (d - 1) * DAY + ((h * 60 + m) * 60 + sec) * 1000
     }
 }

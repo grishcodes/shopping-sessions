@@ -1,6 +1,6 @@
 use super::input::{Key, hash};
 #[cfg(test)]
-use super::{CopyOfEvent, tables::Event};
+use super::{CopyOfEvent, tables::RawEvent};
 #[cfg(test)]
 use ahash::AHashMap;
 
@@ -23,7 +23,7 @@ pub(super) fn location(id: Key, word_mask: usize) -> (usize, u64) {
 }
 
 #[cfg(test)]
-pub(super) fn select(parts: &[Vec<CopyOfEvent>], mut emit: impl FnMut(Event)) {
+pub(super) fn select(parts: &[Vec<CopyOfEvent>], mut emit: impl FnMut(RawEvent)) {
     let count: usize = parts.iter().map(Vec::len).sum();
     if count == 0 {
         return;
@@ -64,11 +64,12 @@ pub(super) fn select(parts: &[Vec<CopyOfEvent>], mut emit: impl FnMut(Event)) {
 mod tests {
     use super::*;
 
+
     fn row(id: Key, ingest: i64, ts: i64) -> CopyOfEvent {
         CopyOfEvent {
             id,
             ingest,
-            event: Event {
+            event: RawEvent {
                 user: id,
                 ts,
                 price: 0,
