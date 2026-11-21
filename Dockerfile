@@ -10,7 +10,12 @@ RUN cargo build --release --locked && cp target/release/shopping-sessions /tmp/s
 # Keys::id and AVX2 auto-vectorization. RUSTFLAGS changes fingerprints, so
 # this rebuilds the crates (~2-3 min). run.sh picks the v3 binary only when
 # the run CPU supports it, falling back to the baseline otherwise.
-RUN RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked && cp target/release/shopping-sessions /tmp/shopping-sessions-v3
+# PGO: the v3 build uses profile data (native/pgo.profdata) collected from
+# the instrumented binary on the 1M dev set + a ~5M-event prefix slice of
+# practice20m (see commit message). Verified ~-10% CPU at 20M vs the
+# non-PGO v3 build, row-identical output, same 4.40 GB RSS at 40M.
+COPY native/pgo.profdata ./pgo.profdata
+RUN RUSTFLAGS="-C target-cpu=x86-64-v3 -C profile-use=/src/engine/pgo.profdata" cargo build --release --locked && cp target/release/shopping-sessions /tmp/shopping-sessions-v3
 
 FROM python:3.12-slim-bookworm
 
