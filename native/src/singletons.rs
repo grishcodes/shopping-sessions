@@ -1,10 +1,10 @@
-use super::{
-    CopyOfEvent,
-    input::{Key, hash},
-    tables::Event,
-};
+use super::input::{Key, hash};
+#[cfg(test)]
+use super::{CopyOfEvent, tables::Event};
+#[cfg(test)]
 use ahash::AHashMap;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Default)]
 struct Bits {
     seen: u64,
@@ -12,7 +12,7 @@ struct Bits {
 }
 
 #[inline]
-fn location(id: Key, word_mask: usize) -> (usize, u64) {
+pub(super) fn location(id: Key, word_mask: usize) -> (usize, u64) {
     let h = hash(id);
     // Skip the low bits already used to partition the input. The two bits
     // live in separate halves of one word, so one cache lookup checks both.
@@ -22,6 +22,7 @@ fn location(id: Key, word_mask: usize) -> (usize, u64) {
     (word, low | high)
 }
 
+#[cfg(test)]
 pub(super) fn select(parts: &[Vec<CopyOfEvent>], mut emit: impl FnMut(Event)) {
     let count: usize = parts.iter().map(Vec::len).sum();
     if count == 0 {

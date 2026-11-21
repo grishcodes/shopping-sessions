@@ -44,21 +44,13 @@ pub fn summarize(
     names: &Names,
     categories: &[Key],
 ) -> (Vec<UserDay>, CampaignDays) {
-    events.sort_unstable_by_key(|e| (e.user, e.ts));
-    clicks.sort_unstable_by_key(|c| (c.user, c.ts));
-    let mut remaining = clicks.as_mut_slice();
     let mut users = Vec::new();
     let mut campaigns = CampaignDays::new();
     let mut sessions = Vec::<Session>::new();
     let mut category_revenue = Vec::<(u32, i64)>::new();
     let mut last_interval = AHashMap::<u32, (i64, i64)>::new();
-    for person in events.chunk_by(|a, b| a.user == b.user) {
+    let mut add_person = |person: &[Event], ads: &[Click]| {
         let user = person[0].user;
-        let earlier = remaining.partition_point(|c| c.user < user);
-        remaining = &mut remaining[earlier..];
-        let count = remaining.partition_point(|c| c.user == user);
-        let (ads, rest) = remaining.split_at_mut(count);
-        remaining = rest;
         sessions.clear();
         let mut previous = None;
         let mut daily: Option<UserDay> = None;
@@ -172,6 +164,102 @@ pub fn summarize(
         for (id, (lo, hi)) in last_interval.drain() {
             count_interval(id, lo, hi)
         }
+    };
+    if std::env::var("PERSON_GROUP").as_deref() == Ok("sort") {
+        events.sort_unstable_by_key(|e| (e.user, e.ts));
+        clicks.sort_unstable_by_key(|c| (c.user, c.ts));
+        let mut remaining = clicks.as_mut_slice();
+        for person in events.chunk_by(|a, b| a.user == b.user) {
+            let user = person[0].user;
+            let earlier = remaining.partition_point(|c| c.user < user);
+            remaining = &mut remaining[earlier..];
+            let count = remaining.partition_point(|c| c.user == user);
+            let (ads, rest) = remaining.split_at_mut(count);
+            remaining = rest;
+            add_person(person, ads);
+        }
+    } else {
+        dense_people(events, clicks, add_person);
     }
     (users, campaigns)
+}
+
+const NO_EVENTS: u32 = u32::MAX;
+
+// Convert each group's count into its exclusive end in the returned array.
+// The caller can iterate group spans sequentially using those ends directly.
+fn scatter<T>(rows: Vec<T>, ordinals: Vec<u32>, mut counts: Vec<usize>) -> (Box<[T]>, Vec<usize>) {
+    assert_eq!(rows.len(), ordinals.len());
+    let mut total = 0;
+    for count in &mut counts {
+        let n = *count;
+        *count = total;
+        total += n;
+    }
+    let mut result = Box::<[T]>::new_uninit_slice(total);
+    for (value, ordinal) in rows.into_iter().zip(ordinals) {
+        if ordinal != NO_EVENTS {
+            let position = &mut counts[ordinal as usize];
+            result[*position].write(value);
+            *position += 1;
+        }
+    }
+    // Each included row incremented exactly one group count in the histogram.
+    // Prefix sums gave the groups disjoint ranges covering 0..total and the
+    // scatter initialized one successive element for each such row.
+    (unsafe { result.assume_init() }, counts)
+}
+
+fn dense_people(events: Vec<Event>, clicks: Vec<Click>, mut visit: impl FnMut(&[Event], &[Click])) {
+    if events.is_empty() {
+        return;
+    }
+    // Group IDs are shard-local. Their order has no effect on either table.
+    let mut ids = AHashMap::with_capacity(events.len() / 30);
+    let mut event_counts = Vec::new();
+    let mut event_ordinals = Vec::with_capacity(events.len());
+    for event in &events {
+        let group = *ids.entry(event.user).or_insert_with(|| {
+            let group = u32::try_from(event_counts.len()).expect("too many people in one shard");
+            assert_ne!(group, NO_EVENTS);
+            event_counts.push(0);
+            group
+        });
+        event_counts[group as usize] += 1;
+        event_ordinals.push(group);
+    }
+    let mut click_counts = vec![0; ids.len()];
+    let mut click_ordinals = Vec::with_capacity(clicks.len());
+    for click in &clicks {
+        let group = ids.get(&click.user).copied().unwrap_or(NO_EVENTS);
+        if group != NO_EVENTS {
+            click_counts[group as usize] += 1;
+        }
+        click_ordinals.push(group);
+    }
+    drop(ids);
+    let (mut events, event_ends) = scatter(events, event_ordinals, event_counts);
+    let (mut clicks, click_ends) = scatter(clicks, click_ordinals, click_counts);
+    let mut a = 0;
+    let mut b = 0;
+    for (end_a, end_b) in event_ends.into_iter().zip(click_ends) {
+        let person = &mut events[a..end_a];
+        let ads = &mut clicks[b..end_b];
+        // Whales can dominate one shard. Rayon can lend idle workers to
+        // those timestamp sorts after other shards have finished.
+        use rayon::prelude::*;
+        if person.len() >= 65536 {
+            person.par_sort_unstable_by_key(|e| e.ts);
+        } else {
+            person.sort_unstable_by_key(|e| e.ts);
+        }
+        if ads.len() >= 65536 {
+            ads.par_sort_unstable_by_key(|c| c.ts);
+        } else {
+            ads.sort_unstable_by_key(|c| c.ts);
+        }
+        visit(person, ads);
+        a = end_a;
+        b = end_b;
+    }
 }

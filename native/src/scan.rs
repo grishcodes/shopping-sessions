@@ -5,14 +5,17 @@ use memchr::memchr_iter;
 enum Scanner {
     Scalar,
     WholeRow,
+    WholeIntel,
     Avx2,
 }
 
 impl Scanner {
-    fn select(request: &str, avx2: bool) -> Self {
+    fn select(request: &str, avx2: bool, bmi_popcnt: bool) -> Self {
         match request {
             "scalar" => Self::Scalar,
             "whole" => Self::WholeRow,
+            "whole-intel" if avx2 && bmi_popcnt => Self::WholeIntel,
+            "whole-intel" => Self::WholeRow,
             "auto" | "avx2" => {
                 if avx2 {
                     Self::Avx2
@@ -20,7 +23,7 @@ impl Scanner {
                     Self::Scalar
                 }
             }
-            _ => panic!("SHOPPING_SCAN must be auto, scalar, whole, or avx2"),
+            _ => panic!("SHOPPING_SCAN must be auto, scalar, whole, whole-intel, or avx2"),
         }
     }
 
@@ -32,14 +35,25 @@ impl Scanner {
             let avx2 = std::is_x86_feature_detected!("avx2");
             #[cfg(not(target_arch = "x86_64"))]
             let avx2 = false;
-            let request = std::env::var("SHOPPING_SCAN").unwrap_or_else(|_| "whole".into());
-            Self::select(&request, avx2)
+            #[cfg(target_arch = "x86_64")]
+            let bmi_popcnt = std::is_x86_feature_detected!("bmi1")
+                && std::is_x86_feature_detected!("bmi2")
+                && std::is_x86_feature_detected!("popcnt");
+            #[cfg(not(target_arch = "x86_64"))]
+            let bmi_popcnt = false;
+            let request = std::env::var("SHOPPING_SCAN").unwrap_or_else(|_| "whole-intel".into());
+            Self::select(&request, avx2, bmi_popcnt)
         })
     }
 }
 
 pub fn rows<const N: usize>(chunk: &[u8], visit: impl FnMut([&[u8]; N])) {
     let selected = Scanner::for_process();
+    #[cfg(target_arch = "x86_64")]
+    if selected == Scanner::WholeIntel {
+        // The process-wide dispatch above checks every enabled feature.
+        return unsafe { crate::fastrows::intel_rows_tuned(chunk, visit) };
+    }
     if selected == Scanner::WholeRow {
         return crate::fastrows::rows(chunk, visit);
     }
@@ -211,11 +225,23 @@ mod tests {
 
     #[test]
     fn selection_respects_scalar_override_and_available_instructions() {
-        assert_eq!(Scanner::select("auto", false), Scanner::Scalar);
-        assert_eq!(Scanner::select("avx2", false), Scanner::Scalar);
-        assert_eq!(Scanner::select("scalar", true), Scanner::Scalar);
-        assert_eq!(Scanner::select("auto", true), Scanner::Avx2);
-        assert_eq!(Scanner::select("avx2", true), Scanner::Avx2);
+        assert_eq!(
+            Scanner::select("whole-intel", false, true),
+            Scanner::WholeRow
+        );
+        assert_eq!(
+            Scanner::select("whole-intel", true, false),
+            Scanner::WholeRow
+        );
+        assert_eq!(
+            Scanner::select("whole-intel", true, true),
+            Scanner::WholeIntel
+        );
+        assert_eq!(Scanner::select("auto", false, false), Scanner::Scalar);
+        assert_eq!(Scanner::select("avx2", false, false), Scanner::Scalar);
+        assert_eq!(Scanner::select("scalar", true, false), Scanner::Scalar);
+        assert_eq!(Scanner::select("auto", true, false), Scanner::Avx2);
+        assert_eq!(Scanner::select("avx2", true, false), Scanner::Avx2);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod clockfast;
+mod compact;
 mod dedup;
 mod fastrows;
 mod identity;
@@ -91,11 +92,12 @@ struct CopyOfEvent {
     event: Event,
 }
 fn winners(
-    parts: Vec<Vec<CopyOfEvent>>,
+    packed: Vec<compact::Part>,
+    origin: i64,
     mode: &str,
     canon: &AHashMap<Key, Key>,
 ) -> Vec<Vec<Event>> {
-    let mut out = reserved_buckets(parts.iter().map(Vec::len).sum());
+    let mut out = reserved_buckets(packed.iter().map(compact::Part::len).sum());
     let mut emit = |mut e: Event| {
         if e.ts != BAD {
             e.user = *canon.get(&e.user).unwrap_or(&e.user);
@@ -103,10 +105,13 @@ fn winners(
         }
     };
     if mode == "singletons" {
-        singletons::select(&parts, emit);
+        compact::select(&packed, origin, emit);
         return out;
     }
-    let mut copies = gather(parts);
+    let mut copies: Vec<CopyOfEvent> = packed
+        .into_iter()
+        .flat_map(|part| part.expand(origin))
+        .collect();
     if matches!(mode, "radix" | "compact-hash") {
         dedup::select(&copies, mode, emit);
     } else if mode == "hash" {
@@ -197,7 +202,7 @@ fn run() -> Result<()> {
                 .par_chunks(group_size)
                 .map(|group| {
                     let mut parts =
-                        reserved_buckets(group.iter().map(|c| c.len()).sum::<usize>() / 80);
+                        compact::buckets(group.iter().map(|c| c.len()).sum::<usize>() / 65);
                     for chunk in group {
                         rows(chunk, |[id, user, ts, ingest, kind, product, price]| {
                             if id.is_empty() {
@@ -239,7 +244,7 @@ fn run() -> Result<()> {
                                     category: 0,
                                 }
                             };
-                            parts[shard(id)].push(CopyOfEvent { id, ingest, event });
+                            parts[shard(id)].push(id, ingest, event, lo);
                         });
                     }
                     parts
@@ -257,11 +262,13 @@ fn run() -> Result<()> {
     ) {
         return Err("unknown EVENT_DEDUP".into());
     }
-    report_buffers("event copies", &parsed);
+    if env::var_os("PROFILE_MEMORY").is_some() {
+        compact::report(&parsed);
+    }
     let events = redistribute(
-        redistribute(parsed)
+        compact::transpose(parsed)
             .into_par_iter()
-            .map(|parts| winners(parts, &mode, &canon))
+            .map(|parts| winners(parts, lo, &mode, &canon))
             .collect(),
     );
     report_buffers("linked events", &events);
@@ -271,7 +278,7 @@ fn run() -> Result<()> {
         .chunks()
         .par_chunks(group_size)
         .map(|group| {
-            let mut parts = reserved_buckets(group.iter().map(|c| c.len()).sum::<usize>() / 48);
+            let mut parts = reserved_buckets(group.iter().map(|c| c.len()).sum::<usize>() / 38);
             for chunk in group {
                 rows(chunk, |[id, user, campaign, ts]| {
                     if id.is_empty() || user.is_empty() {

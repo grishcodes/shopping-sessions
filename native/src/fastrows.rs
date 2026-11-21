@@ -26,8 +26,8 @@ fn portable_masks(block: &[u8; 32]) -> (u32, u32) {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn intel_masks(block: &[u8; 32]) -> (u32, u32) {
+#[inline(always)]
+unsafe fn intel_mask_words(block: &[u8; 32]) -> (u32, u32) {
     use std::arch::x86_64::*;
     // The reference owns all 32 readable bytes. Callers checked AVX2 support.
     unsafe {
@@ -123,7 +123,16 @@ fn scan<const N: usize>(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn intel_rows<const N: usize>(chunk: &[u8], visit: impl FnMut([&[u8]; N])) {
-    scan(chunk, visit, |block| unsafe { intel_masks(block) });
+    scan(chunk, visit, |block| unsafe { intel_mask_words(block) });
+}
+
+// Keep dispatch outside the row loop. Inlining scan and fields here makes
+// delimiter extraction, quote validation and field materialization eligible
+// for BMI / POPCNT as well as the vector comparisons in intel_mask_words.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
+pub(super) unsafe fn intel_rows_tuned<const N: usize>(chunk: &[u8], visit: impl FnMut([&[u8]; N])) {
+    scan(chunk, visit, |block| unsafe { intel_mask_words(block) });
 }
 
 pub fn rows<const N: usize>(chunk: &[u8], visit: impl FnMut([&[u8]; N])) {
